@@ -34,11 +34,14 @@ export interface AppConfig {
     lastSyncAt: string | null
   }
   transcription: {
-    provider: 'gemini'
+    provider: 'gemini' | 'whisper'
     geminiApiKey: string
     geminiModel: string
     autoTranscribe: boolean
     language: string
+    whisperModelSize: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3'
+    whisperLanguage: string
+    whisperUseGpu: boolean
   }
   embeddings: {
     provider: 'ollama'
@@ -84,7 +87,10 @@ const DEFAULT_CONFIG: AppConfig = {
     geminiApiKey: '',
     geminiModel: 'gemini-3-pro-preview', // Best model for audio transcription
     autoTranscribe: true,
-    language: 'es'
+    language: 'es',
+    whisperModelSize: 'base',
+    whisperLanguage: 'auto',
+    whisperUseGpu: false
   },
   embeddings: {
     provider: 'ollama',

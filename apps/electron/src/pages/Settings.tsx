@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
-import { Save, FolderOpen, RefreshCw, AlertCircle, Eye, EyeOff } from 'lucide-react'
+import { Save, FolderOpen, RefreshCw, AlertCircle, Eye, EyeOff, Download, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
@@ -33,6 +33,12 @@ export function Settings() {
   const [syncInterval, setSyncInterval] = useState(15)
   const [geminiApiKey, setGeminiApiKey] = useState('')
   const [geminiModel, setGeminiModel] = useState('gemini-3-pro-preview')
+  const [transcriptionProvider, setTranscriptionProvider] = useState<'gemini' | 'whisper'>('gemini')
+  const [whisperModelSize, setWhisperModelSize] = useState<string>('base')
+  const [whisperLanguage, setWhisperLanguage] = useState('auto')
+  const [whisperUseGpu, setWhisperUseGpu] = useState(false)
+  const [whisperModelDownloaded, setWhisperModelDownloaded] = useState(false)
+  const [whisperDownloadProgress, setWhisperDownloadProgress] = useState<number | null>(null)
   const [chatProvider, setChatProvider] = useState<'gemini' | 'ollama'>('gemini')
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434')
   const [showApiKey, setShowApiKey] = useState(false)
@@ -60,6 +66,27 @@ export function Settings() {
     // Gemini 2.5 Flash-Lite Series
     { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite (Stable)' },
     { value: 'gemini-2.5-flash-lite-preview-09-2025', label: 'Gemini 2.5 Flash Lite Preview' },
+  ]
+
+  const WHISPER_MODELS = [
+    { value: 'tiny', label: 'Tiny (~75 MB)', description: 'Fastest, lowest accuracy' },
+    { value: 'base', label: 'Base (~142 MB)', description: 'Good balance of speed and accuracy' },
+    { value: 'small', label: 'Small (~466 MB)', description: 'Better accuracy' },
+    { value: 'medium', label: 'Medium (~1.5 GB)', description: 'High accuracy' },
+    { value: 'large-v3', label: 'Large V3 (~3.1 GB)', description: 'Best accuracy, slowest' },
+  ]
+
+  const WHISPER_LANGUAGES = [
+    { value: 'auto', label: 'Auto-detect' },
+    { value: 'en', label: 'English' },
+    { value: 'es', label: 'Spanish' },
+    { value: 'fr', label: 'French' },
+    { value: 'de', label: 'German' },
+    { value: 'it', label: 'Italian' },
+    { value: 'pt', label: 'Portuguese' },
+    { value: 'ja', label: 'Japanese' },
+    { value: 'zh', label: 'Chinese' },
+    { value: 'ko', label: 'Korean' },
   ]
 
   // Validation function for config values
@@ -119,10 +146,14 @@ export function Settings() {
   const isTranscriptionDirty = useMemo(() => {
     if (!config) return false
     return (
+      transcriptionProvider !== config.transcription.provider ||
       geminiApiKey !== config.transcription.geminiApiKey ||
-      geminiModel !== (config.transcription.geminiModel || 'gemini-3-pro-preview')
+      geminiModel !== (config.transcription.geminiModel || 'gemini-3-pro-preview') ||
+      whisperModelSize !== (config.transcription.whisperModelSize || 'base') ||
+      whisperLanguage !== (config.transcription.whisperLanguage || 'auto') ||
+      whisperUseGpu !== (config.transcription.whisperUseGpu || false)
     )
-  }, [config, geminiApiKey, geminiModel])
+  }, [config, transcriptionProvider, geminiApiKey, geminiModel, whisperModelSize, whisperLanguage, whisperUseGpu])
 
   const isChatDirty = useMemo(() => {
     if (!config) return false
@@ -155,14 +186,74 @@ export function Settings() {
       setIcsUrl(config.calendar.icsUrl)
       setSyncEnabled(config.calendar.syncEnabled)
       setSyncInterval(config.calendar.syncIntervalMinutes)
+      setTranscriptionProvider(config.transcription.provider || 'gemini')
       setGeminiApiKey(config.transcription.geminiApiKey)
       setGeminiModel(config.transcription.geminiModel || 'gemini-3-pro-preview')
+      setWhisperModelSize(config.transcription.whisperModelSize || 'base')
+      setWhisperLanguage(config.transcription.whisperLanguage || 'auto')
+      setWhisperUseGpu(config.transcription.whisperUseGpu || false)
       setChatProvider(config.chat.provider)
       setOllamaUrl(config.embeddings.ollamaBaseUrl)
       // C-CHAT: Load RAG context window size
       setRagContextSize(config.chat.maxContextChunks)
     }
   }, [config])
+
+  // Check whisper model status when model size changes
+  useEffect(() => {
+    const checkModel = async () => {
+      try {
+        const result = await window.electronAPI.whisper.getModelStatus(whisperModelSize)
+        if (result.success) {
+          setWhisperModelDownloaded(result.downloaded ?? false)
+        }
+      } catch { /* ignore */ }
+    }
+    checkModel()
+  }, [whisperModelSize])
+
+  // Listen for whisper model download progress
+  useEffect(() => {
+    const unsub = window.electronAPI.onWhisperDownloadProgress((data) => {
+      if (data.modelSize === whisperModelSize) {
+        setWhisperDownloadProgress(data.progress)
+        if (data.progress >= 100) {
+          setWhisperModelDownloaded(true)
+          setWhisperDownloadProgress(null)
+        }
+      }
+    })
+    return unsub
+  }, [whisperModelSize])
+
+  const handleDownloadWhisperModel = async () => {
+    setWhisperDownloadProgress(0)
+    try {
+      const result = await window.electronAPI.whisper.downloadModel(whisperModelSize)
+      if (result.success) {
+        setWhisperModelDownloaded(true)
+        toast.success('Model Downloaded', `Whisper ${whisperModelSize} model is ready`)
+      } else {
+        toast.error('Download Failed', result.error || 'Unknown error')
+      }
+    } catch (error) {
+      toast.error('Download Failed', error instanceof Error ? error.message : 'Unknown error')
+    } finally {
+      setWhisperDownloadProgress(null)
+    }
+  }
+
+  const handleDeleteWhisperModel = async () => {
+    try {
+      const result = await window.electronAPI.whisper.deleteModel(whisperModelSize)
+      if (result.success) {
+        setWhisperModelDownloaded(false)
+        toast.success('Model Deleted', `Whisper ${whisperModelSize} model removed`)
+      }
+    } catch (error) {
+      toast.error('Delete Failed', error instanceof Error ? error.message : 'Unknown error')
+    }
+  }
 
   const loadStorageInfo = async () => {
     try {
@@ -237,12 +328,17 @@ export function Settings() {
     }
 
     // Store previous values for rollback
+    const previousProvider = config?.transcription.provider || 'gemini'
     const previousApiKey = config?.transcription.geminiApiKey || ''
     const previousModel = config?.transcription.geminiModel || 'gemini-3-pro-preview'
 
     const updates = {
+      provider: transcriptionProvider,
       geminiApiKey,
-      geminiModel
+      geminiModel,
+      whisperModelSize,
+      whisperLanguage,
+      whisperUseGpu
     }
 
     // Validate before save
@@ -256,9 +352,11 @@ export function Settings() {
     try {
       await updateConfig('transcription', updates)
 
-      toast.success('Settings Saved', `Transcription provider set to ${geminiModel}`)
+      const providerLabel = transcriptionProvider === 'whisper' ? `Whisper (${whisperModelSize})` : geminiModel
+      toast.success('Settings Saved', `Transcription provider set to ${providerLabel}`)
     } catch (error) {
       // Rollback on error
+      setTranscriptionProvider(previousProvider as 'gemini' | 'whisper')
       setGeminiApiKey(previousApiKey)
       setGeminiModel(previousModel)
 
@@ -458,71 +556,213 @@ export function Settings() {
           <Card>
             <CardHeader>
               <CardTitle>Transcription</CardTitle>
-              <CardDescription>Configure Gemini API for transcription</CardDescription>
+              <CardDescription>Configure speech-to-text provider</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
+              {/* Provider Toggle */}
               <div>
-                <label htmlFor="geminiApiKey" className="text-sm font-medium">Gemini API Key</label>
-                <div className="relative mt-1">
-                  <Input
-                    id="geminiApiKey"
-                    type={showApiKey ? 'text' : 'password'}
-                    placeholder="Enter your Gemini API key"
-                    value={geminiApiKey}
-                    onChange={(e) => setGeminiApiKey(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSaveTranscription()}
-                    disabled={saving}
-                    aria-label="Gemini API Key"
-                    aria-describedby="geminiApiKey-description"
-                    className="pr-10"
-                  />
+                <label className="text-sm font-medium">Provider</label>
+                <div className="flex gap-2 mt-1">
                   <Button
-                    type="button"
-                    variant="ghost"
                     size="sm"
-                    className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
-                    tabIndex={-1}
+                    variant={transcriptionProvider === 'gemini' ? 'default' : 'outline'}
+                    onClick={() => setTranscriptionProvider('gemini')}
+                    aria-label="Use Gemini cloud transcription"
+                    aria-pressed={transcriptionProvider === 'gemini'}
                   >
-                    {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    Gemini (Cloud)
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={transcriptionProvider === 'whisper' ? 'default' : 'outline'}
+                    onClick={() => setTranscriptionProvider('whisper')}
+                    aria-label="Use Whisper local transcription"
+                    aria-pressed={transcriptionProvider === 'whisper'}
+                  >
+                    Whisper (Local)
                   </Button>
                 </div>
-                <p id="geminiApiKey-description" className="text-xs text-muted-foreground mt-1">
-                  Get your API key from{' '}
-                  <a
-                    href="https://aistudio.google.com/app/apikey"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-primary hover:underline"
-                  >
-                    Google AI Studio
-                  </a>
-                </p>
               </div>
 
-              <div>
-                <label htmlFor="geminiModel" className="text-sm font-medium">Transcription Model</label>
-                <select
-                  id="geminiModel"
-                  value={geminiModel}
-                  onChange={(e) => setGeminiModel(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSaveTranscription()}
-                  disabled={saving}
-                  aria-label="Transcription Model"
-                  aria-describedby="geminiModel-description"
-                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
-                >
-                  {GEMINI_MODELS.map((model) => (
-                    <option key={model.value} value={model.value}>
-                      {model.label}
-                    </option>
-                  ))}
-                </select>
-                <p id="geminiModel-description" className="text-xs text-muted-foreground mt-1">
-                  Gemini 3 Pro provides the best transcription accuracy
-                </p>
-              </div>
+              {/* Gemini Settings */}
+              {transcriptionProvider === 'gemini' && (
+                <>
+                  <div>
+                    <label htmlFor="geminiApiKey" className="text-sm font-medium">Gemini API Key</label>
+                    <div className="relative mt-1">
+                      <Input
+                        id="geminiApiKey"
+                        type={showApiKey ? 'text' : 'password'}
+                        placeholder="Enter your Gemini API key"
+                        value={geminiApiKey}
+                        onChange={(e) => setGeminiApiKey(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleSaveTranscription()}
+                        disabled={saving}
+                        aria-label="Gemini API Key"
+                        aria-describedby="geminiApiKey-description"
+                        className="pr-10"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0"
+                        onClick={() => setShowApiKey(!showApiKey)}
+                        aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
+                        tabIndex={-1}
+                      >
+                        {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </Button>
+                    </div>
+                    <p id="geminiApiKey-description" className="text-xs text-muted-foreground mt-1">
+                      Get your API key from{' '}
+                      <a
+                        href="https://aistudio.google.com/app/apikey"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-primary hover:underline"
+                      >
+                        Google AI Studio
+                      </a>
+                    </p>
+                  </div>
+
+                  <div>
+                    <label htmlFor="geminiModel" className="text-sm font-medium">Transcription Model</label>
+                    <select
+                      id="geminiModel"
+                      value={geminiModel}
+                      onChange={(e) => setGeminiModel(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleSaveTranscription()}
+                      disabled={saving}
+                      aria-label="Transcription Model"
+                      aria-describedby="geminiModel-description"
+                      className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    >
+                      {GEMINI_MODELS.map((model) => (
+                        <option key={model.value} value={model.value}>
+                          {model.label}
+                        </option>
+                      ))}
+                    </select>
+                    <p id="geminiModel-description" className="text-xs text-muted-foreground mt-1">
+                      Gemini 3 Pro provides the best transcription accuracy
+                    </p>
+                  </div>
+                </>
+              )}
+
+              {/* Whisper Settings */}
+              {transcriptionProvider === 'whisper' && (
+                <>
+                  <div>
+                    <label htmlFor="whisperModel" className="text-sm font-medium">Model Size</label>
+                    <select
+                      id="whisperModel"
+                      value={whisperModelSize}
+                      onChange={(e) => setWhisperModelSize(e.target.value)}
+                      disabled={saving}
+                      aria-label="Whisper model size"
+                      className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    >
+                      {WHISPER_MODELS.map((model) => (
+                        <option key={model.value} value={model.value}>
+                          {model.label}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {WHISPER_MODELS.find(m => m.value === whisperModelSize)?.description}
+                    </p>
+                  </div>
+
+                  {/* Model download status */}
+                  <div className="flex items-center gap-2">
+                    {whisperModelDownloaded ? (
+                      <>
+                        <span className="text-sm text-green-600 font-medium">Model downloaded</span>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={handleDeleteWhisperModel}
+                          disabled={saving}
+                          aria-label="Delete whisper model"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </>
+                    ) : whisperDownloadProgress !== null ? (
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-sm">Downloading... {whisperDownloadProgress}%</span>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => window.electronAPI.whisper.cancelDownload()}
+                            aria-label="Cancel download"
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                        <div className="w-full bg-muted rounded-full h-2">
+                          <div
+                            className="bg-primary h-2 rounded-full transition-all"
+                            style={{ width: `${whisperDownloadProgress}%` }}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={handleDownloadWhisperModel}
+                        disabled={saving}
+                        aria-label="Download whisper model"
+                      >
+                        <Download className="h-4 w-4 mr-2" />
+                        Download Model
+                      </Button>
+                    )}
+                  </div>
+
+                  <div>
+                    <label htmlFor="whisperLanguage" className="text-sm font-medium">Language</label>
+                    <select
+                      id="whisperLanguage"
+                      value={whisperLanguage}
+                      onChange={(e) => setWhisperLanguage(e.target.value)}
+                      disabled={saving}
+                      aria-label="Whisper transcription language"
+                      className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    >
+                      {WHISPER_LANGUAGES.map((lang) => (
+                        <option key={lang.value} value={lang.value}>
+                          {lang.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="whisperGpu"
+                      checked={whisperUseGpu}
+                      onChange={(e) => setWhisperUseGpu(e.target.checked)}
+                      disabled={saving}
+                      className="h-4 w-4 rounded border-gray-300"
+                    />
+                    <label htmlFor="whisperGpu" className="text-sm font-medium">
+                      Use GPU acceleration
+                    </label>
+                    <span className="text-xs text-muted-foreground">(Metal on macOS, CUDA/Vulkan on Windows/Linux)</span>
+                  </div>
+
+                  <p className="text-xs text-muted-foreground">
+                    A Gemini API key is still recommended for AI summaries, action items, and meeting matching.
+                  </p>
+                </>
+              )}
 
               <Button
                 onClick={handleSaveTranscription}

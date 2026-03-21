@@ -5,6 +5,7 @@ import { extname } from 'path'
 
 const readFileAsync = promisify(readFile)
 import { getConfig } from './config'
+import { transcribeWithWhisper, cancelWhisperTranscription } from './whisper-provider'
 import {
   getRecordingById,
   updateRecordingTranscriptionStatus,
@@ -73,6 +74,7 @@ let cancelRequested = false
 export function cancelTranscription(recordingId: string): void {
   removeFromQueueByRecordingId(recordingId)
   updateRecordingTranscriptionStatus(recordingId, 'none')
+  cancelWhisperTranscription().catch(() => {}) // Cancel whisper if it's running
   notifyRenderer('transcription:cancelled', { recordingId })
 }
 
@@ -105,7 +107,8 @@ async function processQueue(): Promise<void> {
   }
 
   const config = getConfig()
-  if (!config.transcription.geminiApiKey) {
+  // Only require Gemini API key when using Gemini as the transcription provider
+  if (config.transcription.provider === 'gemini' && !config.transcription.geminiApiKey) {
     console.error('[Transcription] Cannot process queue: Gemini API key not configured')
 
     // Mark all pending items as failed with clear error message
@@ -364,75 +367,64 @@ Only include detections with confidence >= 0.6.`
   }
 }
 
-async function transcribeRecording(
-  recordingId: string,
+/**
+ * Phase 1: Get raw transcript text (provider-dependent).
+ * Gemini sends audio to cloud API; Whisper runs locally via whisper.cpp.
+ */
+async function getTranscriptText(
+  filePath: string,
   progressCallback?: (stage: string, progress: number) => void
-): Promise<void> {
-  const recording = getRecordingById(recordingId)
-  if (!recording || !recording.file_path) {
-    throw new Error(`Recording not found or no local file: ${recordingId}`)
-  }
-
-  if (!existsSync(recording.file_path)) {
-    throw new Error(`Recording file not found: ${recording.file_path}`)
-  }
-
+): Promise<{ fullText: string; language: string; provider: string; model: string }> {
   const config = getConfig()
+
+  if (config.transcription.provider === 'whisper') {
+    const result = await transcribeWithWhisper(
+      filePath,
+      {
+        modelSize: config.transcription.whisperModelSize,
+        language: config.transcription.whisperLanguage,
+        useGpu: config.transcription.whisperUseGpu
+      },
+      progressCallback
+    )
+    return {
+      fullText: result.text,
+      language: result.language,
+      provider: 'whisper',
+      model: `whisper-${config.transcription.whisperModelSize}`
+    }
+  }
+
+  // Gemini provider (default)
   if (!config.transcription.geminiApiKey) {
     throw new Error('Gemini API key not configured')
   }
 
-  console.log(`Transcribing: ${recording.filename}`)
-  // AI-13: Use standard enum values matching Recording.transcription_status
-  updateRecordingTranscriptionStatus(recordingId, 'processing')
+  progressCallback?.('reading_file', 5)
 
-  progressCallback?.('reading_file', 5) // spec-014: progress reporting
-
-  // Read the audio file asynchronously to avoid blocking the main process
-  const audioBuffer = await readFileAsync(recording.file_path)
+  const audioBuffer = await readFileAsync(filePath)
   const base64Audio = audioBuffer.toString('base64')
 
-  // Determine MIME type
-  const ext = extname(recording.file_path).toLowerCase()
+  const ext = extname(filePath).toLowerCase()
   const mimeTypes: Record<string, string> = {
     '.wav': 'audio/wav',
     '.mp3': 'audio/mp3',
     '.m4a': 'audio/mp4',
     '.ogg': 'audio/ogg',
     '.webm': 'audio/webm',
-    '.hda': 'audio/mp3' // HiDock H1E outputs MPEG MP3 format
+    '.hda': 'audio/mp3'
   }
   const mimeType = mimeTypes[ext] || 'audio/wav'
 
-  // Initialize Gemini
   const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
   const model = genAI.getGenerativeModel({ model: config.transcription.geminiModel || 'gemini-2.0-flash-exp' })
 
-  // Find candidate meetings for this recording's time window
-  const candidateMeetings = findCandidateMeetingsForRecording(recordingId)
-  console.log(`Found ${candidateMeetings.length} candidate meetings for recording ${recordingId}`)
+  progressCallback?.('transcribing', 20)
 
-  // Build meeting context for better transcription
-  let meetingContext = ''
-  if (candidateMeetings.length > 0) {
-    meetingContext = `\n\nPOSSIBLE MEETING CONTEXT (use this to improve transcription accuracy):
-${candidateMeetings.map((m, i) => `
-Meeting ${i + 1}: "${m.subject}"
-  Time: ${new Date(m.start_time).toLocaleString()} - ${new Date(m.end_time).toLocaleString()}
-  ${m.organizer_name ? `Organizer: ${m.organizer_name}` : ''}
-  ${m.location ? `Location: ${m.location}` : ''}
-  ${m.description ? `Description: ${m.description.slice(0, 200)}...` : ''}
-`).join('\n')}`
-  }
-
-  progressCallback?.('transcribing', 20) // spec-014: progress reporting
-
-  // First, transcribe the audio with meeting context
   const transcriptionPrompt = `Transcribe this audio recording.
 The audio may be in Spanish or English - transcribe in the original language.
 Provide a clean, accurate transcription of all speech.
 If there are multiple speakers, try to indicate speaker changes with "Speaker 1:", "Speaker 2:", etc.
-${meetingContext}
 Return ONLY the transcription, no additional commentary.`
 
   const transcriptionResult = await model.generateContent([
@@ -445,11 +437,43 @@ Return ONLY the transcription, no additional commentary.`
     { text: transcriptionPrompt }
   ])
 
-  const fullText = transcriptionResult.response.text()
+  return {
+    fullText: transcriptionResult.response.text(),
+    language: config.transcription.language || 'unknown',
+    provider: 'gemini',
+    model: config.transcription.geminiModel
+  }
+}
 
-  progressCallback?.('analyzing', 50) // spec-014: progress reporting
+/**
+ * Phase 2: Analyze transcript with Gemini (summary, action items, meeting matching).
+ * Returns empty analysis if Gemini API key is not configured (graceful degradation for Whisper-only users).
+ */
+async function analyzeTranscript(
+  fullText: string,
+  recordingId: string,
+  candidateMeetings: ReturnType<typeof findCandidateMeetingsForRecording>
+): Promise<{
+  summary?: string
+  action_items?: string[]
+  topics?: string[]
+  key_points?: string[]
+  title_suggestion?: string
+  question_suggestions?: string[]
+  language?: string
+  selected_meeting_id?: string
+  meeting_confidence?: number
+  selection_reason?: string
+}> {
+  const config = getConfig()
+  if (!config.transcription.geminiApiKey) {
+    console.log('[Transcription] No Gemini API key — skipping AI analysis')
+    return {}
+  }
 
-  // Build meeting selection prompt if there are multiple candidates
+  const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
+  const model = genAI.getGenerativeModel({ model: config.transcription.geminiModel || 'gemini-2.0-flash-exp' })
+
   let meetingSelectionSection = ''
   if (candidateMeetings.length > 1) {
     meetingSelectionSection = `
@@ -472,7 +496,6 @@ ${candidateMeetings.map((m, i) => `   ${i + 1}. "${m.subject}" (ID: ${m.id})`).j
    "selection_reason": "your reasoning"`
   }
 
-  // Now analyze the transcription for summary, action items, etc.
   const analysisPrompt = `Analyze this meeting transcript and provide:
 1. A brief summary (2-3 sentences)
 2. A list of action items mentioned (as a JSON array of strings)
@@ -505,34 +528,52 @@ Respond in JSON format:
   const analysisResult = await model.generateContent(analysisPrompt)
   const analysisText = analysisResult.response.text()
 
-  // Parse the analysis JSON
-  let analysis: {
-    summary?: string
-    action_items?: string[]
-    topics?: string[]
-    key_points?: string[]
-    title_suggestion?: string
-    question_suggestions?: string[]
-    language?: string
-    selected_meeting_id?: string
-    meeting_confidence?: number
-    selection_reason?: string
-  } = {}
-
   try {
-    // Extract JSON from the response (might be wrapped in markdown code blocks)
     const jsonMatch = analysisText.match(/\{[\s\S]*\}/)
     if (jsonMatch) {
-      analysis = JSON.parse(jsonMatch[0])
+      return JSON.parse(jsonMatch[0])
     }
   } catch (e) {
     console.warn('Failed to parse analysis JSON:', e)
-    analysis = { summary: 'Analysis failed', language: 'unknown' }
   }
+  return { summary: 'Analysis failed', language: 'unknown' }
+}
+
+async function transcribeRecording(
+  recordingId: string,
+  progressCallback?: (stage: string, progress: number) => void
+): Promise<void> {
+  const recording = getRecordingById(recordingId)
+  if (!recording || !recording.file_path) {
+    throw new Error(`Recording not found or no local file: ${recordingId}`)
+  }
+
+  if (!existsSync(recording.file_path)) {
+    throw new Error(`Recording file not found: ${recording.file_path}`)
+  }
+
+  const config = getConfig()
+
+  console.log(`Transcribing (${config.transcription.provider}): ${recording.filename}`)
+  updateRecordingTranscriptionStatus(recordingId, 'processing')
+
+  // Phase 1: Get raw transcript text (provider-dependent)
+  const { fullText, language, provider, model: transcriptionModel } = await getTranscriptText(
+    recording.file_path,
+    progressCallback
+  )
+
+  progressCallback?.('analyzing', 50)
+
+  // Find candidate meetings for this recording's time window
+  const candidateMeetings = findCandidateMeetingsForRecording(recordingId)
+  console.log(`Found ${candidateMeetings.length} candidate meetings for recording ${recordingId}`)
+
+  // Phase 2: Analyze transcript with Gemini (gracefully skipped if no API key)
+  const analysis = await analyzeTranscript(fullText, recordingId, candidateMeetings)
 
   // Process AI meeting selection
   if (candidateMeetings.length > 0) {
-    // Add all candidates to the database
     for (const meeting of candidateMeetings) {
       const isSelected = analysis.selected_meeting_id === meeting.id
       const confidence = isSelected ? (analysis.meeting_confidence || 0.5) : 0.1
@@ -541,7 +582,6 @@ Respond in JSON format:
       addRecordingMeetingCandidate(recordingId, meeting.id, confidence, reason, isSelected)
     }
 
-    // If AI selected a meeting, link it
     if (analysis.selected_meeting_id) {
       const selectedMeeting = candidateMeetings.find(m => m.id === analysis.selected_meeting_id)
       if (selectedMeeting) {
@@ -564,7 +604,7 @@ Respond in JSON format:
     id: `trans_${recordingId}`,
     recording_id: recordingId,
     full_text: fullText,
-    language: analysis.language || 'unknown',
+    language: analysis.language || language || 'unknown',
     summary: analysis.summary,
     action_items: analysis.action_items ? JSON.stringify(analysis.action_items) : undefined,
     topics: analysis.topics ? JSON.stringify(analysis.topics) : undefined,
@@ -572,22 +612,20 @@ Respond in JSON format:
     sentiment: undefined,
     speakers: undefined,
     word_count: wordCount,
-    transcription_provider: 'gemini',
-    transcription_model: config.transcription.geminiModel,
+    transcription_provider: provider,
+    transcription_model: transcriptionModel,
     title_suggestion: analysis.title_suggestion,
     question_suggestions: analysis.question_suggestions ? JSON.stringify(analysis.question_suggestions) : undefined
   }
 
   insertTranscript(transcript)
-  // AI-13: Use standard enum value 'complete' (not 'transcribed')
   updateRecordingTranscriptionStatus(recordingId, 'complete')
 
-  // Auto-update recording title if we have a title suggestion
   if (analysis.title_suggestion) {
     updateKnowledgeCaptureTitle(recordingId, analysis.title_suggestion)
   }
 
-  progressCallback?.('detecting_actionables', 75) // spec-014: progress reporting
+  progressCallback?.('detecting_actionables', 75)
 
   // Detect actionables from transcript
   try {
@@ -602,13 +640,11 @@ Respond in JSON format:
       questions: analysis.question_suggestions
     })
 
-    // Create actionable entries with TEXT IDs
     const VALID_TEMPLATE_IDS = ['meeting_minutes', 'interview_feedback', 'project_status', 'action_items']
 
     for (const detection of detections) {
       const actionableId = `act_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
-      // Sanitize template ID: fall back to 'meeting_minutes' if AI suggests an invalid one
       const sanitizedTemplate = detection.suggestedTemplate && VALID_TEMPLATE_IDS.includes(detection.suggestedTemplate)
         ? detection.suggestedTemplate
         : 'meeting_minutes'
@@ -620,7 +656,7 @@ Respond in JSON format:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           actionableId,
-          sourceKnowledgeId, // source_knowledge_id references knowledge_captures.id
+          sourceKnowledgeId,
           detection.type,
           detection.suggestedTitle,
           detection.reason,
@@ -637,15 +673,13 @@ Respond in JSON format:
     }
   } catch (error) {
     console.error('[Actionable Detection] Failed to create actionables:', error)
-    // Don't fail the transcription if actionable detection fails
   }
 
-  progressCallback?.('indexing', 85) // spec-014: progress reporting
+  progressCallback?.('indexing', 85)
 
   // Index transcript into vector store for RAG
   try {
     const vectorStore = getVectorStore()
-    // Use the AI-linked meeting ID if available, otherwise fall back to the original
     const meetingId = analysis.selected_meeting_id || recording.meeting_id
     let meetingSubject: string | undefined
 
@@ -666,7 +700,7 @@ Respond in JSON format:
     console.warn('Failed to index transcript into vector store:', e)
   }
 
-  progressCallback?.('complete', 100) // spec-014: progress reporting
+  progressCallback?.('complete', 100)
   console.log(`Transcription complete: ${recording.filename} (${wordCount} words)`)
 }
 

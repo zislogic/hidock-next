@@ -456,6 +456,16 @@ export interface ElectronAPI {
   onTranscriptionCancelled: (callback: (data: { recordingId: string }) => void) => () => void
   onTranscriptionAllCancelled: (callback: (data: { count: number }) => void) => () => void
 
+  // Whisper Model Management
+  whisper: {
+    getDownloadedModels: () => Promise<{ success: boolean; models: string[]; error?: string }>
+    getModelStatus: (modelSize: string) => Promise<{ success: boolean; downloaded?: boolean; path?: string; approxMB?: number; error?: string }>
+    downloadModel: (modelSize: string) => Promise<{ success: boolean; error?: string }>
+    cancelDownload: () => Promise<{ success: boolean; error?: string }>
+    deleteModel: (modelSize: string) => Promise<{ success: boolean; deleted?: boolean; error?: string }>
+  }
+  onWhisperDownloadProgress: (callback: (data: { modelSize: string; progress: number; bytesDownloaded: number; totalBytes: number }) => void) => () => void
+
   // Security Warning Events
   onSecurityWarning: (callback: (data: { type: string; message: string }) => void) => () => void
 
@@ -719,6 +729,23 @@ const electronAPI: ElectronAPI = {
       return () => {
         ipcRenderer.removeListener('integrity:progress', handler)
       }
+    }
+  },
+
+  // Whisper Model Management
+  whisper: {
+    getDownloadedModels: () => callIPC('whisper:getDownloadedModels'),
+    getModelStatus: (modelSize: string) => callIPC('whisper:getModelStatus', modelSize),
+    downloadModel: (modelSize: string) => callIPC('whisper:downloadModel', modelSize),
+    cancelDownload: () => callIPC('whisper:cancelDownload'),
+    deleteModel: (modelSize: string) => callIPC('whisper:deleteModel', modelSize)
+  },
+
+  onWhisperDownloadProgress: (callback: (data: { modelSize: string; progress: number; bytesDownloaded: number; totalBytes: number }) => void) => {
+    const handler = (_event: any, data: { modelSize: string; progress: number; bytesDownloaded: number; totalBytes: number }) => callback(data)
+    ipcRenderer.on('whisper:download-progress', handler)
+    return () => {
+      ipcRenderer.removeListener('whisper:download-progress', handler)
     }
   },
 

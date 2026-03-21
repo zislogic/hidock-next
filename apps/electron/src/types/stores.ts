@@ -303,11 +303,14 @@ export interface AppConfig {
     lastSyncAt: string | null
   }
   transcription: {
-    provider: 'gemini'
+    provider: 'gemini' | 'whisper'
     geminiApiKey: string
     geminiModel: string
     autoTranscribe: boolean
     language: string
+    whisperModelSize: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3'
+    whisperLanguage: string
+    whisperUseGpu: boolean
   }
   embeddings: {
     provider: 'ollama'

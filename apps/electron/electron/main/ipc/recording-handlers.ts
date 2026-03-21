@@ -537,12 +537,21 @@ export function registerRecordingHandlers(): void {
   // Add a recording to the transcription queue
   ipcMain.handle('recordings:addToQueue', async (_, recordingId: string) => {
     try {
-      // Validate API key is configured before queueing
+      // Validate provider requirements before queueing
       const config = getConfig()
-      if (!config.transcription.geminiApiKey) {
+      if (config.transcription.provider === 'gemini' && !config.transcription.geminiApiKey) {
         return {
           success: false,
           error: 'Transcription API key not configured. Please add your API key in Settings.'
+        }
+      }
+      if (config.transcription.provider === 'whisper') {
+        const { isModelDownloaded } = await import('../services/whisper-models')
+        if (!isModelDownloaded(config.transcription.whisperModelSize)) {
+          return {
+            success: false,
+            error: `Whisper model "${config.transcription.whisperModelSize}" not downloaded. Please download it in Settings.`
+          }
         }
       }
 
@@ -624,6 +633,79 @@ export function registerRecordingHandlers(): void {
     } catch (error) {
       console.error('recordings:updateTranscriptionStatus error:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error occurred' }
+    }
+  })
+
+  // --- Whisper model management ---
+
+  ipcMain.handle('whisper:getDownloadedModels', async () => {
+    try {
+      const { getDownloadedModels } = await import('../services/whisper-models')
+      return { success: true, models: getDownloadedModels() }
+    } catch (error) {
+      console.error('whisper:getDownloadedModels error:', error)
+      return { success: false, models: [], error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('whisper:getModelStatus', async (_, modelSize: string) => {
+    try {
+      const { isModelDownloaded, getModelPath, WHISPER_MODELS } = await import('../services/whisper-models')
+      const size = modelSize as import('../services/whisper-models').WhisperModelSize
+      const info = WHISPER_MODELS[size]
+      if (!info) return { success: false, error: `Unknown model size: ${modelSize}` }
+      return {
+        success: true,
+        downloaded: isModelDownloaded(size),
+        path: getModelPath(size),
+        approxMB: info.approxMB
+      }
+    } catch (error) {
+      console.error('whisper:getModelStatus error:', error)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('whisper:downloadModel', async (event, modelSize: string) => {
+    try {
+      const { downloadModel } = await import('../services/whisper-models')
+      const size = modelSize as import('../services/whisper-models').WhisperModelSize
+      const mainWin = BrowserWindow.fromWebContents(event.sender)
+      await downloadModel(size, (progress, bytesDownloaded, totalBytes) => {
+        mainWin?.webContents.send('whisper:download-progress', {
+          modelSize: size,
+          progress,
+          bytesDownloaded,
+          totalBytes
+        })
+      })
+      return { success: true }
+    } catch (error) {
+      console.error('whisper:downloadModel error:', error)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('whisper:cancelDownload', async () => {
+    try {
+      const { cancelModelDownload } = await import('../services/whisper-models')
+      cancelModelDownload()
+      return { success: true }
+    } catch (error) {
+      console.error('whisper:cancelDownload error:', error)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('whisper:deleteModel', async (_, modelSize: string) => {
+    try {
+      const { deleteModel } = await import('../services/whisper-models')
+      const size = modelSize as import('../services/whisper-models').WhisperModelSize
+      const deleted = deleteModel(size)
+      return { success: true, deleted }
+    } catch (error) {
+      console.error('whisper:deleteModel error:', error)
+      return { success: false, error: (error as Error).message }
     }
   })
 
