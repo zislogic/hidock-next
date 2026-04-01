@@ -133,49 +133,37 @@ export interface CardInfo {
  * - Default: 16kHz stereo 8-bit with 4x correction
  */
 function calculateDurationSeconds(fileLength: number, fileVersion: number): number {
-  if (shouldLogProtocol()) console.log(`[Jensen] calculateDurationSeconds: fileLength=${fileLength}, fileVersion=${fileVersion}`)
-
   const WAV_HEADER_SIZE = 44
   const CHANNELS = 2  // Stereo
   const BYTES_PER_SAMPLE = 1  // 8-bit samples
-  const CORRECTION_FACTOR = 4  // Applied to all versions per Python implementation
 
   if (fileVersion === 1) {
-    // Version 1: HDA compressed format - verified against real recordings
-    // Example: 15.7MB file = 1959 seconds = 32m39s at 8000 bytes/sec effective rate
-    // Note: Python uses different formula but this was empirically verified
+    // Version 1: HDA compressed format - empirically verified: ~8000 bytes/sec effective rate
     const duration = Math.round(fileLength / 8000)
     if (shouldLogProtocol()) console.log(`[Jensen] Version 1 duration: ${duration} seconds (${Math.floor(duration/60)}m ${duration%60}s)`)
     return duration
   } else if (fileVersion === 2) {
-    // Version 2: 48kHz stereo 8-bit WAV with 4x correction
-    // Python: (file_size - 44) / (48000 * 2 * 1) * 4 = (file_size - 44) / 24000
+    // Version 2: 48kHz stereo 8-bit WAV
     const bytesPerSecond = 48000 * CHANNELS * BYTES_PER_SAMPLE  // 96000
-    const effectiveBps = bytesPerSecond / CORRECTION_FACTOR  // 24000
-    const duration = fileLength > WAV_HEADER_SIZE ? Math.round((fileLength - WAV_HEADER_SIZE) / effectiveBps) : 0
+    const duration = fileLength > WAV_HEADER_SIZE ? Math.round((fileLength - WAV_HEADER_SIZE) / bytesPerSecond) : 0
     if (shouldLogProtocol()) console.log(`[Jensen] Version 2 duration: ${duration} seconds`)
     return duration
   } else if (fileVersion === 3) {
-    // Version 3: 24kHz stereo 8-bit WAV with 4x correction
-    // Python: (file_size - 44) / (24000 * 2 * 1) * 4 = (file_size - 44) / 12000
+    // Version 3: 24kHz stereo 8-bit WAV
     const bytesPerSecond = 24000 * CHANNELS * BYTES_PER_SAMPLE  // 48000
-    const effectiveBps = bytesPerSecond / CORRECTION_FACTOR  // 12000
-    const duration = fileLength > WAV_HEADER_SIZE ? Math.round((fileLength - WAV_HEADER_SIZE) / effectiveBps) : 0
+    const duration = fileLength > WAV_HEADER_SIZE ? Math.round((fileLength - WAV_HEADER_SIZE) / bytesPerSecond) : 0
     if (shouldLogProtocol()) console.log(`[Jensen] Version 3 duration: ${duration} seconds`)
     return duration
   } else if (fileVersion === 5) {
-    // Version 5: 12kHz format with 4x correction
-    // Python: (file_size / 12000) * 4 = file_size / 3000
-    const effectiveBps = 12000 / CORRECTION_FACTOR  // 3000
-    const duration = Math.round(fileLength / effectiveBps)
+    // Version 5: 12kHz format
+    const bytesPerSecond = 12000
+    const duration = Math.round(fileLength / bytesPerSecond)
     if (shouldLogProtocol()) console.log(`[Jensen] Version 5 duration: ${duration} seconds`)
     return duration
   } else {
-    // Default: 16kHz stereo 8-bit with 4x correction
-    // Python: (file_size / (16000 * 2 * 1)) * 4 = file_size / 8000
+    // Default: 16kHz stereo 8-bit
     const bytesPerSecond = 16000 * CHANNELS * BYTES_PER_SAMPLE  // 32000
-    const effectiveBps = bytesPerSecond / CORRECTION_FACTOR  // 8000
-    const duration = Math.round(fileLength / effectiveBps)
+    const duration = Math.round(fileLength / bytesPerSecond)
     if (shouldLogProtocol()) console.log(`[Jensen] Default (version ${fileVersion}) duration: ${duration} seconds`)
     return duration
   }

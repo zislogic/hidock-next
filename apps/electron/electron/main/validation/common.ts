@@ -11,9 +11,10 @@ import { z } from 'zod'
 // =============================================================================
 
 /**
- * UUID string validation
+ * ID string validation
+ * Accepts both UUID format and filename-based IDs (e.g. from device recordings)
  */
-export const UUIDSchema = z.string().uuid()
+export const UUIDSchema = z.string().min(1, 'ID must not be empty').max(500)
 
 /**
  * ISO datetime string validation

@@ -129,21 +129,31 @@ class OutputGeneratorService {
         meeting_count: String(meetings.length)
       }
     } else if (options.knowledgeCaptureId) {
-      // Single knowledge capture
+      // Try as knowledge capture first, then fall back to recording ID
       const kc = queryOne<any>('SELECT * FROM knowledge_captures WHERE id = ?', [options.knowledgeCaptureId])
-      if (!kc) {
-        throw new Error(`Knowledge capture not found: ${options.knowledgeCaptureId}`)
-      }
+      if (kc) {
+        const transcript = getTranscriptByRecordingId(kc.source_recording_id)
+        if (transcript?.full_text) {
+          transcripts.push(transcript.full_text)
+        }
 
-      const transcript = getTranscriptByRecordingId(kc.source_recording_id)
-      if (transcript?.full_text) {
-        transcripts.push(transcript.full_text)
-      }
-
-      contextInfo = {
-        capture_title: kc.title,
-        capture_date: new Date(kc.captured_at).toLocaleDateString(),
-        capture_summary: kc.summary || ''
+        contextInfo = {
+          capture_title: kc.title,
+          capture_date: new Date(kc.captured_at).toLocaleDateString(),
+          capture_summary: kc.summary || ''
+        }
+      } else {
+        // Fall back: treat as recording ID and look up transcript directly
+        const transcript = getTranscriptByRecordingId(options.knowledgeCaptureId)
+        if (transcript?.full_text) {
+          transcripts.push(transcript.full_text)
+        }
+        const recording = queryOne<any>('SELECT * FROM recordings WHERE id = ?', [options.knowledgeCaptureId])
+        contextInfo = {
+          capture_title: recording?.filename || 'Recording',
+          capture_date: recording?.date_recorded ? new Date(recording.date_recorded).toLocaleDateString() : new Date().toLocaleDateString(),
+          capture_summary: ''
+        }
       }
     }
 

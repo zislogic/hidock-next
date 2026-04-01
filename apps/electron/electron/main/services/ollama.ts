@@ -213,5 +213,14 @@ export function getOllamaService(): OllamaService {
   return ollamaInstance
 }
 
+/**
+ * Reset the Ollama singleton so the next call to getOllamaService() re-reads config.
+ * Call this after saving settings that affect Ollama (URL, model name).
+ */
+export function resetOllamaService(): void {
+  ollamaInstance = null
+  console.log('[Ollama] Service instance reset — will re-initialize on next use')
+}
+
 export { OllamaService }
 export type { OllamaChatMessage }

@@ -20,49 +20,95 @@ export function useOperations() {
 
   // ── Transcription ──────────────────────────────────────
 
-  const queueTranscription = useCallback(async (recording: UnifiedRecording) => {
-    if (!hasLocalPath(recording)) {
-      toast({ title: 'Cannot transcribe', description: 'File not available locally. Download first.', variant: 'error' })
-      return false
-    }
-    if (recording.transcriptionStatus === 'processing' || recording.transcriptionStatus === 'complete') {
-      return false
-    }
-
-    // Check if API key is configured before queuing
-    try {
-      const result = await window.electronAPI.config.getValue('transcription.geminiApiKey')
-      const apiKey = result?.success ? result.data : null
-      if (!apiKey || (typeof apiKey === 'string' && apiKey.trim() === '')) {
+  const queueTranscription = useCallback(
+    async (
+      recording: UnifiedRecording,
+      overrides?: { provider?: string; model?: string; language?: string }
+    ) => {
+      if (!hasLocalPath(recording)) {
         toast({
-          title: 'API key required',
-          description: 'Please configure your Gemini API key in Settings before transcribing.',
+          title: 'Cannot transcribe',
+          description: 'File not available locally. Download first.',
           variant: 'error'
         })
         return false
       }
-    } catch (e) {
-      console.error('Failed to check API key:', e)
-      toast({ title: 'Configuration error', description: 'Could not verify API key configuration', variant: 'error' })
-      return false
-    }
-
-    try {
-      await window.electronAPI.recordings.updateStatus(recording.id, 'pending')
-      const queueItemId = await window.electronAPI.recordings.addToQueue(recording.id)
-      if (!queueItemId) {
-        toast({ title: 'Failed to queue transcription', description: 'Could not add to queue', variant: 'error' })
+      // Allow re-transcription — only block if currently processing
+      if (recording.transcriptionStatus === 'processing' || recording.transcriptionStatus === 'pending') {
         return false
       }
-      addToQueue(queueItemId, recording.id, recording.filename)
-      toast({ title: 'Transcription queued', description: recording.filename })
-      return true
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Unknown error'
-      toast({ title: 'Failed to queue transcription', description: msg, variant: 'error' })
-      return false
-    }
-  }, [addToQueue])
+
+      // Determine effective provider from override or global config
+      const effectiveProvider = overrides?.provider || undefined
+
+      // Check provider-specific requirements before queuing
+      try {
+        const provider = effectiveProvider || (() => {
+          // Fall back to reading global config
+          return 'check_global'
+        })()
+
+        if (provider === 'check_global') {
+          const providerResult = await window.electronAPI.config.getValue('transcription.provider')
+          const globalProvider = providerResult?.success ? providerResult.data : 'gemini'
+          if (globalProvider === 'gemini') {
+            const result = await window.electronAPI.config.getValue('transcription.geminiApiKey')
+            const apiKey = result?.success ? result.data : null
+            if (!apiKey || (typeof apiKey === 'string' && apiKey.trim() === '')) {
+              toast({
+                title: 'API key required',
+                description: 'Please configure your Gemini API key in Settings before transcribing.',
+                variant: 'error'
+              })
+              return false
+            }
+          }
+        } else if (provider === 'gemini') {
+          const result = await window.electronAPI.config.getValue('transcription.geminiApiKey')
+          const apiKey = result?.success ? result.data : null
+          if (!apiKey || (typeof apiKey === 'string' && apiKey.trim() === '')) {
+            toast({
+              title: 'API key required',
+              description: 'Please configure your Gemini API key in Settings before transcribing.',
+              variant: 'error'
+            })
+            return false
+          }
+        }
+        // Whisper model validation is done server-side in the IPC handler
+      } catch (e) {
+        console.error('Failed to check transcription config:', e)
+        toast({
+          title: 'Configuration error',
+          description: 'Could not verify transcription configuration',
+          variant: 'error'
+        })
+        return false
+      }
+
+      const isRetranscribe = recording.transcriptionStatus === 'complete'
+
+      try {
+        await window.electronAPI.recordings.updateStatus(recording.id, 'pending')
+        const queueItemId = await window.electronAPI.recordings.addToQueue(recording.id, overrides)
+        if (!queueItemId) {
+          toast({ title: 'Failed to queue transcription', description: 'Could not add to queue', variant: 'error' })
+          return false
+        }
+        addToQueue(queueItemId, recording.id, recording.filename)
+        toast({
+          title: isRetranscribe ? 'Re-transcription queued' : 'Transcription queued',
+          description: recording.filename
+        })
+        return true
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Unknown error'
+        toast({ title: 'Failed to queue transcription', description: msg, variant: 'error' })
+        return false
+      }
+    },
+    [addToQueue]
+  )
 
   const queueBulkTranscriptions = useCallback(async (recordings: UnifiedRecording[]) => {
     const eligible = recordings.filter(
@@ -73,21 +119,25 @@ export function useOperations() {
       return 0
     }
 
-    // Check if API key is configured before queuing
+    // Check provider-specific requirements before queuing
     try {
-      const result = await window.electronAPI.config.getValue('transcription.geminiApiKey')
-      const apiKey = result?.success ? result.data : null
-      if (!apiKey || (typeof apiKey === 'string' && apiKey.trim() === '')) {
-        toast({
-          title: 'API key required',
-          description: 'Please configure your Gemini API key in Settings before transcribing.',
-          variant: 'error'
-        })
-        return 0
+      const providerResult = await window.electronAPI.config.getValue('transcription.provider')
+      const provider = providerResult?.success ? providerResult.data : 'gemini'
+      if (provider === 'gemini') {
+        const result = await window.electronAPI.config.getValue('transcription.geminiApiKey')
+        const apiKey = result?.success ? result.data : null
+        if (!apiKey || (typeof apiKey === 'string' && apiKey.trim() === '')) {
+          toast({
+            title: 'API key required',
+            description: 'Please configure your Gemini API key in Settings before transcribing.',
+            variant: 'error'
+          })
+          return 0
+        }
       }
     } catch (e) {
-      console.error('Failed to check API key:', e)
-      toast({ title: 'Configuration error', description: 'Could not verify API key configuration', variant: 'error' })
+      console.error('Failed to check transcription config:', e)
+      toast({ title: 'Configuration error', description: 'Could not verify transcription configuration', variant: 'error' })
       return 0
     }
 

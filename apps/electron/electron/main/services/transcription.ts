@@ -5,6 +5,7 @@ import { extname } from 'path'
 
 const readFileAsync = promisify(readFile)
 import { getConfig } from './config'
+import { getOllamaService } from './ollama'
 import { transcribeWithWhisper, cancelWhisperTranscription } from './whisper-provider'
 import {
   getRecordingById,
@@ -106,34 +107,6 @@ async function processQueue(): Promise<void> {
     return
   }
 
-  const config = getConfig()
-  // Only require Gemini API key when using Gemini as the transcription provider
-  if (config.transcription.provider === 'gemini' && !config.transcription.geminiApiKey) {
-    console.error('[Transcription] Cannot process queue: Gemini API key not configured')
-
-    // Mark all pending items as failed with clear error message
-    const pendingItems = getQueueItems('pending')
-    const processingItems = getQueueItems('processing')
-
-    const allStuckItems = [...pendingItems, ...processingItems]
-    if (allStuckItems.length > 0) {
-      console.log(`[Transcription] Marking ${allStuckItems.length} stuck items as failed (no API key)`)
-
-      for (const item of allStuckItems) {
-        updateQueueItem(item.id, 'failed', 'Gemini API key not configured. Please add your API key in Settings.')
-        updateRecordingTranscriptionStatus(item.recording_id, 'error')
-        notifyRenderer('transcription:failed', {
-          queueItemId: item.id,
-          recordingId: item.recording_id,
-          error: 'Gemini API key not configured. Please add your API key in Settings.'
-        })
-      }
-    }
-
-    releaseTranscriptionLock(processId)
-    return
-  }
-
   try {
     // spec-014: Retry failed items with max attempts
     // B-TXN-001: Exponential backoff before retrying failed items
@@ -229,7 +202,13 @@ async function processQueue(): Promise<void> {
         }
 
         try {
-          await transcribeRecording(item.recording_id, progressCallback)
+          // Read per-item overrides from queue (set when user picked specific model/language)
+          const itemOverrides = {
+            provider: item.override_provider || undefined,
+            model: item.override_model || undefined,
+            language: item.override_language || undefined
+          }
+          await transcribeRecording(item.recording_id, progressCallback, itemOverrides)
         } finally {
           clearInterval(progressTicker) // Always clean up the ticker
         }
@@ -291,14 +270,51 @@ interface ActionableDetection {
   suggestedRecipients?: string[]
 }
 
+/**
+ * Generate text using the configured AI provider (Ollama or Gemini).
+ * Returns null if no provider is available.
+ */
+async function generateWithAI(prompt: string): Promise<string | null> {
+  const config = getConfig()
+
+  // Try Ollama first if configured as chat provider
+  if (config.chat.provider === 'ollama') {
+    try {
+      const ollama = getOllamaService()
+      const isAvailable = await ollama.isAvailable()
+      if (isAvailable) {
+        const result = await ollama.generate(prompt, 'You are a helpful AI assistant that analyzes meeting transcripts. Always respond with valid JSON.')
+        return result
+      }
+      console.warn('[AI] Ollama configured but not available, falling back to Gemini')
+    } catch (e) {
+      console.warn('[AI] Ollama error, falling back to Gemini:', e instanceof Error ? e.message : e)
+    }
+  }
+
+  // Fall back to Gemini
+  if (config.transcription.geminiApiKey) {
+    const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
+    const model = genAI.getGenerativeModel({ model: config.transcription.geminiModel || 'gemini-2.0-flash-exp' })
+    const result = await model.generateContent(prompt)
+    return result.response.text()
+  }
+
+  return null
+}
+
 async function detectActionables(
   transcriptText: string,
   knowledgeCaptureId: string,
   metadata: { title?: string; questions?: string[] }
 ): Promise<ActionableDetection[]> {
   const config = getConfig()
-  if (!config.transcription.geminiApiKey) {
-    console.log('[Actionable Detection] Gemini API key not configured, skipping')
+
+  // Check if any AI provider is available
+  const hasGemini = !!config.transcription.geminiApiKey
+  const hasOllama = config.chat.provider === 'ollama'
+  if (!hasGemini && !hasOllama) {
+    console.log('[Actionable Detection] No AI provider configured, skipping')
     return []
   }
 
@@ -341,11 +357,11 @@ Return as JSON array. If no actionables detected, return empty array [].
 Only include detections with confidence >= 0.6.`
 
   try {
-    const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
-    const model = genAI.getGenerativeModel({ model: config.transcription.geminiModel || 'gemini-2.0-flash-exp' })
-
-    const result = await model.generateContent(prompt)
-    const responseText = result.response.text()
+    const responseText = await generateWithAI(prompt)
+    if (!responseText) {
+      console.log('[Actionable Detection] No AI provider available')
+      return []
+    }
 
     // Extract JSON from response (might be wrapped in markdown code blocks)
     const jsonMatch = responseText.match(/\[[\s\S]*\]/)
@@ -373,16 +389,20 @@ Only include detections with confidence >= 0.6.`
  */
 async function getTranscriptText(
   filePath: string,
-  progressCallback?: (stage: string, progress: number) => void
+  progressCallback?: (stage: string, progress: number) => void,
+  overrides?: { provider?: string; model?: string; language?: string }
 ): Promise<{ fullText: string; language: string; provider: string; model: string }> {
   const config = getConfig()
+  const effectiveProvider = overrides?.provider || config.transcription.provider
 
-  if (config.transcription.provider === 'whisper') {
+  if (effectiveProvider === 'whisper') {
+    const effectiveModel = (overrides?.model || config.transcription.whisperModelSize) as import('./whisper-models').WhisperModelSize
+    const effectiveLanguage = overrides?.language || config.transcription.whisperLanguage
     const result = await transcribeWithWhisper(
       filePath,
       {
-        modelSize: config.transcription.whisperModelSize,
-        language: config.transcription.whisperLanguage,
+        modelSize: effectiveModel,
+        language: effectiveLanguage,
         useGpu: config.transcription.whisperUseGpu
       },
       progressCallback
@@ -391,7 +411,7 @@ async function getTranscriptText(
       fullText: result.text,
       language: result.language,
       provider: 'whisper',
-      model: `whisper-${config.transcription.whisperModelSize}`
+      model: `whisper-${effectiveModel}`
     }
   }
 
@@ -416,13 +436,19 @@ async function getTranscriptText(
   }
   const mimeType = mimeTypes[ext] || 'audio/wav'
 
+  const effectiveGeminiModel = overrides?.model || config.transcription.geminiModel || 'gemini-2.0-flash-exp'
   const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
-  const model = genAI.getGenerativeModel({ model: config.transcription.geminiModel || 'gemini-2.0-flash-exp' })
+  const model = genAI.getGenerativeModel({ model: effectiveGeminiModel })
 
   progressCallback?.('transcribing', 20)
 
+  const effectiveLanguage = overrides?.language || config.transcription.language || ''
+  const languageHint = effectiveLanguage && effectiveLanguage !== 'auto'
+    ? `The audio is in ${effectiveLanguage}. Transcribe in the original language.`
+    : 'The audio may be in any language - transcribe in the original language.'
+
   const transcriptionPrompt = `Transcribe this audio recording.
-The audio may be in Spanish or English - transcribe in the original language.
+${languageHint}
 Provide a clean, accurate transcription of all speech.
 If there are multiple speakers, try to indicate speaker changes with "Speaker 1:", "Speaker 2:", etc.
 Return ONLY the transcription, no additional commentary.`
@@ -439,9 +465,9 @@ Return ONLY the transcription, no additional commentary.`
 
   return {
     fullText: transcriptionResult.response.text(),
-    language: config.transcription.language || 'unknown',
+    language: effectiveLanguage || 'unknown',
     provider: 'gemini',
-    model: config.transcription.geminiModel
+    model: effectiveGeminiModel
   }
 }
 
@@ -466,13 +492,14 @@ async function analyzeTranscript(
   selection_reason?: string
 }> {
   const config = getConfig()
-  if (!config.transcription.geminiApiKey) {
-    console.log('[Transcription] No Gemini API key — skipping AI analysis')
+
+  // Check if any AI provider is available
+  const hasGemini = !!config.transcription.geminiApiKey
+  const hasOllama = config.chat.provider === 'ollama'
+  if (!hasGemini && !hasOllama) {
+    console.log('[Transcription] No AI provider available — skipping AI analysis')
     return {}
   }
-
-  const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
-  const model = genAI.getGenerativeModel({ model: config.transcription.geminiModel || 'gemini-2.0-flash-exp' })
 
   let meetingSelectionSection = ''
   if (candidateMeetings.length > 1) {
@@ -525,23 +552,31 @@ Respond in JSON format:
   "selection_reason": "..."` : ''}
 }`
 
-  const analysisResult = await model.generateContent(analysisPrompt)
-  const analysisText = analysisResult.response.text()
-
   try {
-    const jsonMatch = analysisText.match(/\{[\s\S]*\}/)
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0])
+    const analysisText = await generateWithAI(analysisPrompt)
+    if (!analysisText) {
+      console.log('[Transcription] No AI provider available for analysis')
+      return {}
+    }
+
+    try {
+      const jsonMatch = analysisText.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0])
+      }
+    } catch (e) {
+      console.warn('Failed to parse analysis JSON:', e)
     }
   } catch (e) {
-    console.warn('Failed to parse analysis JSON:', e)
+    console.warn('[Transcription] AI analysis failed (transcript still saved):', e instanceof Error ? e.message : e)
   }
-  return { summary: 'Analysis failed', language: 'unknown' }
+  return {}
 }
 
 async function transcribeRecording(
   recordingId: string,
-  progressCallback?: (stage: string, progress: number) => void
+  progressCallback?: (stage: string, progress: number) => void,
+  overrides?: { provider?: string; model?: string; language?: string }
 ): Promise<void> {
   const recording = getRecordingById(recordingId)
   if (!recording || !recording.file_path) {
@@ -553,14 +588,16 @@ async function transcribeRecording(
   }
 
   const config = getConfig()
+  const effectiveProvider = overrides?.provider || config.transcription.provider
 
-  console.log(`Transcribing (${config.transcription.provider}): ${recording.filename}`)
+  console.log(`Transcribing (${effectiveProvider}): ${recording.filename}`)
   updateRecordingTranscriptionStatus(recordingId, 'processing')
 
   // Phase 1: Get raw transcript text (provider-dependent)
   const { fullText, language, provider, model: transcriptionModel } = await getTranscriptText(
     recording.file_path,
-    progressCallback
+    progressCallback,
+    overrides
   )
 
   progressCallback?.('analyzing', 50)

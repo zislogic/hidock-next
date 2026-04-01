@@ -30,6 +30,10 @@ const zod = require("zod");
 const crypto$1 = require("crypto");
 const generativeAi = require("@google/generative-ai");
 const util = require("util");
+const whisper_node = require("@fugood/whisper.node");
+const https = require("https");
+const child_process = require("child_process");
+const os = require("os");
 const uuid = require("uuid");
 const events = require("events");
 const is = {
@@ -125,6 +129,24 @@ const optimizer = {
     });
   }
 };
+function encryptSensitive(value) {
+  try {
+    if (electron.safeStorage.isEncryptionAvailable() && value) {
+      return "__enc__" + electron.safeStorage.encryptString(value).toString("base64");
+    }
+  } catch {
+  }
+  return value;
+}
+function decryptSensitive(value) {
+  try {
+    if (value.startsWith("__enc__") && electron.safeStorage.isEncryptionAvailable()) {
+      return electron.safeStorage.decryptString(Buffer.from(value.slice(7), "base64"));
+    }
+  } catch {
+  }
+  return value;
+}
 const DEFAULT_CONFIG = {
   version: "1.0.0",
   storage: {
@@ -143,7 +165,10 @@ const DEFAULT_CONFIG = {
     geminiModel: "gemini-3-pro-preview",
     // Best model for audio transcription
     autoTranscribe: true,
-    language: "es"
+    language: "es",
+    whisperModelSize: "large-v3",
+    whisperLanguage: "auto",
+    whisperUseGpu: true
   },
   embeddings: {
     provider: "ollama",
@@ -185,6 +210,9 @@ async function initializeConfig() {
     if (fs.existsSync(configPath)) {
       const fileContent = fs.readFileSync(configPath, "utf-8");
       const savedConfig = JSON.parse(fileContent);
+      if (savedConfig.calendar?.icsUrl) {
+        savedConfig.calendar.icsUrl = decryptSensitive(savedConfig.calendar.icsUrl);
+      }
       config = deepMerge(DEFAULT_CONFIG, savedConfig);
     } else {
       await saveConfig(DEFAULT_CONFIG);
@@ -204,7 +232,14 @@ async function saveConfig(newConfig) {
   if (!fs.existsSync(configDir)) {
     fs.mkdirSync(configDir, { recursive: true });
   }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  const toWrite = {
+    ...config,
+    calendar: {
+      ...config.calendar,
+      icsUrl: encryptSensitive(config.calendar.icsUrl)
+    }
+  };
+  fs.writeFileSync(configPath, JSON.stringify(toWrite, null, 2));
 }
 async function updateConfig(section, values) {
   const updatedSection = { ...config[section], ...values };
@@ -709,6 +744,9 @@ CREATE TABLE IF NOT EXISTS transcription_queue (
     retry_count INTEGER DEFAULT 0,
     progress INTEGER DEFAULT 0,
     error_message TEXT,
+    override_provider TEXT,
+    override_model TEXT,
+    override_language TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     started_at TEXT,
     completed_at TEXT,
@@ -1533,6 +1571,7 @@ async function initializeDatabase() {
     const recordingsInfo = database2.exec("PRAGMA table_info(recordings)");
     const recCols = recordingsInfo[0].values.map((col) => col[1]);
     const recordingRepairs = [
+      { name: "display_name", def: "TEXT" },
       { name: "migrated_to_capture_id", def: "TEXT" },
       { name: "migration_status", def: "TEXT CHECK(migration_status IN ('pending', 'migrated', 'skipped', 'error')) DEFAULT 'pending'" },
       { name: "migrated_at", def: "TEXT" }
@@ -1576,7 +1615,10 @@ async function initializeDatabase() {
       const queueCols = queueInfo[0].values.map((col) => col[1]);
       const queueRepairs = [
         { name: "retry_count", def: "INTEGER DEFAULT 0" },
-        { name: "progress", def: "INTEGER DEFAULT 0" }
+        { name: "progress", def: "INTEGER DEFAULT 0" },
+        { name: "override_provider", def: "TEXT" },
+        { name: "override_model", def: "TEXT" },
+        { name: "override_language", def: "TEXT" }
       ];
       for (const col of queueRepairs) {
         if (!queueCols.includes(col.name)) {
@@ -1706,7 +1748,10 @@ function runInTransaction(fn) {
     saveDatabase();
     return result;
   } catch (error2) {
-    database2.run("ROLLBACK");
+    try {
+      database2.run("ROLLBACK");
+    } catch {
+    }
     throw error2;
   }
 }
@@ -1893,7 +1938,7 @@ function extractContactsFromMeetingDataInternal(meeting) {
   }
 }
 function getRecordings() {
-  return queryAll("SELECT * FROM recordings ORDER BY date_recorded DESC");
+  return queryAll("SELECT * FROM recordings WHERE status != 'deleted' ORDER BY date_recorded DESC");
 }
 function getRecordingById(id) {
   return queryOne("SELECT * FROM recordings WHERE id = ?", [id]);
@@ -1914,6 +1959,9 @@ function getRecordingsByIds(ids) {
 }
 function getRecordingByFilename(filename) {
   return queryOne("SELECT * FROM recordings WHERE filename = ?", [filename]);
+}
+function updateRecordingDisplayName(id, displayName) {
+  run("UPDATE recordings SET display_name = ? WHERE id = ?", [displayName, id]);
 }
 function updateRecordingLifecycle(id, updates) {
   const setClauses = [];
@@ -1992,6 +2040,9 @@ function insertRecording(recording) {
 function updateRecordingStatus(id, status) {
   run("UPDATE recordings SET status = ? WHERE id = ?", [status, id]);
 }
+function getDeletedRecordingFilenames() {
+  return queryAll("SELECT filename FROM recordings WHERE status = 'deleted'").map((r) => r.filename);
+}
 function updateRecordingTranscriptionStatus(id, transcriptionStatus) {
   run("UPDATE recordings SET transcription_status = ? WHERE id = ?", [transcriptionStatus, id]);
 }
@@ -2066,9 +2117,12 @@ function searchTranscripts(query) {
     [`%${escaped}%`, `%${escaped}%`, `%${escaped}%`]
   );
 }
-function addToQueue(recordingId) {
+function addToQueue(recordingId, overrides) {
   const id = crypto.randomUUID();
-  run("INSERT INTO transcription_queue (id, recording_id) VALUES (?, ?)", [id, recordingId]);
+  run(
+    "INSERT INTO transcription_queue (id, recording_id, override_provider, override_model, override_language) VALUES (?, ?, ?, ?, ?)",
+    [id, recordingId, overrides?.provider ?? null, overrides?.model ?? null, overrides?.language ?? null]
+  );
   return id;
 }
 function getQueueItems(status) {
@@ -2621,6 +2675,7 @@ const database = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProp
   getContactsByEmails,
   getContactsForMeeting,
   getDatabase,
+  getDeletedRecordingFilenames,
   getKnowledgeIdsForProject,
   getMeetingById,
   getMeetings,
@@ -2672,6 +2727,7 @@ const database = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProp
   updateProject,
   updateQueueItem,
   updateQueueProgress,
+  updateRecordingDisplayName,
   updateRecordingLifecycle,
   updateRecordingStatus,
   updateRecordingStorageTier,
@@ -2687,6 +2743,24 @@ function success(data) {
 function error(code, message, details) {
   return { success: false, error: { code, message, details } };
 }
+function emitActivityLog(type, message, details) {
+  const entry = {
+    type,
+    message,
+    details,
+    timestamp: /* @__PURE__ */ new Date()
+  };
+  const windows = electron.BrowserWindow.getAllWindows();
+  for (const win of windows) {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send("activity-log:entry", entry);
+    }
+  }
+}
+const activityLog = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  emitActivityLog
+}, Symbol.toStringTag, { value: "Module" }));
 function registerConfigHandlers() {
   electron.ipcMain.handle("config:get", async () => {
     try {
@@ -2703,9 +2777,11 @@ function registerConfigHandlers() {
   electron.ipcMain.handle("config:set", async (_, newConfig) => {
     try {
       await saveConfig(newConfig);
+      emitActivityLog("info", "Settings saved");
       return success(getConfig());
     } catch (err) {
       console.error("[config:set] Error:", err);
+      emitActivityLog("error", "Failed to save settings", err instanceof Error ? err.message : void 0);
       return error(
         "VALIDATION_ERROR",
         err instanceof Error ? err.message : "Failed to save configuration",
@@ -2718,9 +2794,11 @@ function registerConfigHandlers() {
     async (_, section, values) => {
       try {
         await updateConfig(section, values);
+        emitActivityLog("info", `Settings updated: ${String(section)}`);
         return success(getConfig());
       } catch (err) {
         console.error(`[config:update-section] Error updating ${String(section)}:`, err);
+        emitActivityLog("error", `Failed to update ${String(section)} settings`, err instanceof Error ? err.message : void 0);
         return error(
           "VALIDATION_ERROR",
           err instanceof Error ? err.message : `Failed to update ${String(section)} settings`,
@@ -2934,6 +3012,9 @@ function categorizeCalendarError(error2) {
     return { message: error2.message, category: "network" };
   }
   const message = error2 instanceof Error ? error2.message : String(error2);
+  if (message.includes("401") || message.includes("403") || message.includes("Unauthorized") || message.includes("Forbidden") || message.includes("authentication") || message.includes("authorization")) {
+    return { message, category: "auth" };
+  }
   if (message.includes("fetch") || message.includes("ECONNREFUSED") || message.includes("ENOTFOUND") || message.includes("ETIMEDOUT") || message.includes("network") || message.includes("Failed to fetch") || message.includes("ERR_NETWORK") || /^Failed to fetch calendar: \d+/.test(message)) {
     return { message, category: "network" };
   }
@@ -3108,11 +3189,12 @@ function safeToJSDate(icalTime, tzidHint) {
 }
 async function syncCalendar(icsUrl) {
   console.log("Starting calendar sync...");
-  const { emitActivityLog } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
-  emitActivityLog("info", "Syncing calendar...", "Fetching calendar events");
+  const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
+  emitActivityLog2("info", "Syncing calendar...", "Fetching calendar events");
   try {
     const validation = validateCalendarUrl(icsUrl);
     if (!validation.valid) {
+      emitActivityLog2("error", "Calendar sync failed", validation.error ?? "Invalid URL");
       return {
         success: false,
         meetingsCount: 0,
@@ -3126,7 +3208,8 @@ async function syncCalendar(icsUrl) {
     }
     const icsData = await response.text();
     const cachePath = path.join(getCachePath(), "calendar.ics");
-    fs.writeFileSync(cachePath, icsData, "utf-8");
+    const { writeFile } = await import("fs/promises");
+    await writeFile(cachePath, icsData, "utf-8");
     await yieldToEventLoop();
     const meetings = await parseICSAsync(icsData);
     await yieldToEventLoop();
@@ -3143,7 +3226,7 @@ async function syncCalendar(icsUrl) {
       console.error("Failed to persist sync timestamp:", configError);
     }
     console.log(`Calendar sync complete: ${meetings.length} meetings`);
-    emitActivityLog("success", "Calendar sync complete", `Loaded ${meetings.length} meetings`);
+    emitActivityLog2("success", "Calendar sync complete", `Loaded ${meetings.length} meetings`);
     return {
       success: true,
       meetingsCount: meetings.length,
@@ -3152,7 +3235,7 @@ async function syncCalendar(icsUrl) {
   } catch (error2) {
     console.error("Calendar sync failed:", error2);
     const categorized = categorizeCalendarError(error2);
-    emitActivityLog("error", "Calendar sync failed", categorized.message);
+    emitActivityLog2("error", "Calendar sync failed", categorized.message);
     return {
       success: false,
       meetingsCount: 0,
@@ -3174,7 +3257,8 @@ async function parseICSAsync(icsData) {
     }
     const vevent = vevents[eventIndex];
     const event = new ICAL.Event(vevent);
-    if (event.status === "CANCELLED") {
+    const eventStatus = vevent.getFirstPropertyValue("status");
+    if (eventStatus === "CANCELLED") {
       continue;
     }
     const uid = event.uid;
@@ -3242,7 +3326,8 @@ async function parseICSAsync(icsData) {
         organizer_email: organizerEmail,
         attendees: attendees.length > 0 ? JSON.stringify(attendees) : void 0,
         description,
-        is_recurring: 0,
+        // CS-005: Use actual isRecurring flag instead of hardcoded 0
+        is_recurring: isRecurring ? 1 : 0,
         recurrence_rule: void 0,
         meeting_url: meetingUrl
       });
@@ -3257,7 +3342,7 @@ function getLastSyncTime() {
 const QualityLevelSchema = zod.z.enum(["high", "medium", "low"]);
 zod.z.enum(["manual", "auto", "ai"]);
 zod.z.object({
-  recordingId: zod.z.string().uuid("Recording ID must be a valid UUID"),
+  recordingId: zod.z.string().min(1),
   quality: QualityLevelSchema,
   reason: zod.z.string().max(1e3).optional(),
   assessedBy: zod.z.string().max(200).optional()
@@ -3266,7 +3351,7 @@ zod.z.object({
   quality: QualityLevelSchema
 });
 zod.z.object({
-  recordingIds: zod.z.array(zod.z.string().uuid()).min(1).max(1e3)
+  recordingIds: zod.z.array(zod.z.string().min(1)).min(1).max(1e3)
 });
 const StorageTierSchema = zod.z.enum(["hot", "warm", "cold", "archive"]);
 const MinAgeOverrideSchema = zod.z.record(
@@ -3284,14 +3369,14 @@ zod.z.object({
   minAgeDays: zod.z.number().int().min(0).max(36500).optional()
 });
 zod.z.object({
-  recordingIds: zod.z.array(zod.z.string().uuid()).min(1).max(1e3),
+  recordingIds: zod.z.array(zod.z.string().min(1)).min(1).max(1e3),
   archive: zod.z.boolean().default(false)
 });
 zod.z.object({
-  recordingId: zod.z.string().uuid(),
+  recordingId: zod.z.string().min(1),
   quality: QualityLevelSchema
 });
-const RecordingIdSchema = zod.z.string().uuid("Recording ID must be a valid UUID");
+const RecordingIdSchema = zod.z.string().min(1, "Recording ID must not be empty").max(500);
 const GetRecordingByIdSchema = zod.z.object({
   id: RecordingIdSchema
 });
@@ -3299,11 +3384,11 @@ const DeleteRecordingSchema = zod.z.object({
   id: RecordingIdSchema
 });
 const DeleteBatchRecordingsSchema = zod.z.object({
-  ids: zod.z.array(zod.z.string().uuid("Each ID must be a valid UUID")).min(1).max(1e3)
+  ids: zod.z.array(zod.z.string().min(1)).min(1).max(1e3)
 });
 const LinkRecordingToMeetingSchema = zod.z.object({
   recordingId: RecordingIdSchema,
-  meetingId: zod.z.string().uuid("Meeting ID must be a valid UUID")
+  meetingId: zod.z.string().min(1)
 });
 const UnlinkRecordingFromMeetingSchema = zod.z.object({
   recordingId: RecordingIdSchema
@@ -3358,7 +3443,7 @@ function validateRecordingId(id) {
   return result.data;
 }
 function validateRecordingIds(ids) {
-  const result = zod.z.array(zod.z.string().uuid()).min(1).max(1e3).safeParse(ids);
+  const result = zod.z.array(zod.z.string().min(1)).min(1).max(1e3).safeParse(ids);
   if (!result.success) {
     throw new ValidationError(result.error.issues[0]?.message || "Invalid recording IDs array");
   }
@@ -3405,8 +3490,8 @@ function validateMinAgeOverride(override) {
 let syncInterval = null;
 function registerCalendarHandlers() {
   electron.ipcMain.handle("calendar:sync", async () => {
-    const config22 = getConfig();
-    if (!config22.calendar.icsUrl) {
+    const config2 = getConfig();
+    if (!config2.calendar.icsUrl) {
       return {
         success: false,
         error: "No calendar URL configured",
@@ -3414,7 +3499,7 @@ function registerCalendarHandlers() {
       };
     }
     try {
-      const result = await syncCalendar(config22.calendar.icsUrl);
+      const result = await syncCalendar(config2.calendar.icsUrl);
       if (!result || typeof result.success !== "boolean") {
         console.error("[calendar:sync] syncCalendar returned malformed result:", result);
         return { success: false, error: "Sync returned an invalid result", meetingsCount: 0 };
@@ -3427,8 +3512,8 @@ function registerCalendarHandlers() {
     }
   });
   electron.ipcMain.handle("calendar:clear-and-sync", async () => {
-    const config22 = getConfig();
-    if (!config22.calendar.icsUrl) {
+    const config2 = getConfig();
+    if (!config2.calendar.icsUrl) {
       return {
         success: false,
         error: "No calendar URL configured",
@@ -3437,7 +3522,7 @@ function registerCalendarHandlers() {
     }
     try {
       clearAllMeetings();
-      const result = await syncCalendar(config22.calendar.icsUrl);
+      const result = await syncCalendar(config2.calendar.icsUrl);
       if (!result || typeof result.success !== "boolean") {
         console.error("[calendar:clear-and-sync] syncCalendar returned malformed result:", result);
         return { success: false, error: "Sync returned an invalid result", meetingsCount: 0 };
@@ -3490,8 +3575,8 @@ function registerCalendarHandlers() {
         return { success: false, error: result.error.issues[0]?.message || "Invalid interval" };
       }
       await updateConfig("calendar", { syncIntervalMinutes: result.data.minutes });
-      const config22 = getConfig();
-      if (config22.calendar.syncEnabled) {
+      const config2 = getConfig();
+      if (config2.calendar.syncEnabled) {
         stopAutoSync();
         startAutoSync();
       }
@@ -3504,6 +3589,8 @@ function registerCalendarHandlers() {
   electron.ipcMain.handle("calendar:get-settings", async () => {
     return getConfig().calendar;
   });
+}
+function initializeCalendarAutoSync() {
   const config2 = getConfig();
   if (config2.calendar.syncEnabled && config2.calendar.icsUrl) {
     startAutoSync();
@@ -3523,9 +3610,15 @@ function startAutoSync() {
     const currentConfig = getConfig();
     if (currentConfig.calendar.icsUrl) {
       try {
-        await syncCalendar(currentConfig.calendar.icsUrl);
+        const result = await syncCalendar(currentConfig.calendar.icsUrl);
+        if (!result.success) {
+          const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
+          emitActivityLog2("warning", "Background calendar sync failed", result.error ?? "Unknown error");
+        }
       } catch (err) {
         console.error("Calendar sync failed:", err);
+        const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
+        emitActivityLog2("error", "Background calendar sync crashed", err instanceof Error ? err.message : "Unknown error");
       }
     }
   }, intervalMs);
@@ -4085,6 +4178,369 @@ function getOllamaService() {
   }
   return ollamaInstance;
 }
+const WHISPER_MODELS = {
+  tiny: {
+    size: "tiny",
+    filename: "ggml-tiny.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+    approxMB: 75
+  },
+  base: {
+    size: "base",
+    filename: "ggml-base.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+    approxMB: 142
+  },
+  small: {
+    size: "small",
+    filename: "ggml-small.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+    approxMB: 466
+  },
+  medium: {
+    size: "medium",
+    filename: "ggml-medium.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+    approxMB: 1500
+  },
+  "large-v3-turbo": {
+    size: "large-v3-turbo",
+    filename: "ggml-large-v3-turbo.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    approxMB: 1600
+  },
+  "large-v3": {
+    size: "large-v3",
+    filename: "ggml-large-v3.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+    approxMB: 3100
+  }
+};
+const VAD_MODEL = {
+  filename: "ggml-silero-vad.bin",
+  url: "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
+  approxMB: 1
+};
+function getVadModelPath() {
+  return path.join(getModelsDir(), VAD_MODEL.filename);
+}
+function isVadModelDownloaded() {
+  return fs.existsSync(getVadModelPath());
+}
+let activeDownloadAbort = null;
+function getModelsDir() {
+  const dir = path.join(electron.app.getPath("userData"), "whisper-models");
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+function getModelPath(size) {
+  return path.join(getModelsDir(), WHISPER_MODELS[size].filename);
+}
+function isModelDownloaded(size) {
+  return fs.existsSync(getModelPath(size));
+}
+function getDownloadedModels() {
+  const dir = getModelsDir();
+  const files = fs.readdirSync(dir);
+  return Object.keys(WHISPER_MODELS).filter(
+    (size) => files.includes(WHISPER_MODELS[size].filename)
+  );
+}
+function deleteModel(size) {
+  const path2 = getModelPath(size);
+  if (fs.existsSync(path2)) {
+    fs.unlinkSync(path2);
+    return true;
+  }
+  return false;
+}
+function cancelModelDownload() {
+  if (activeDownloadAbort) {
+    activeDownloadAbort.abort();
+    activeDownloadAbort = null;
+  }
+}
+async function downloadFile(url, destPath, abort, onProgress) {
+  const tempPath = destPath + ".download";
+  if (fs.existsSync(destPath)) return;
+  await new Promise((resolve, reject) => {
+    const follow = (followUrl, redirectCount = 0) => {
+      if (redirectCount > 5) {
+        reject(new Error("Too many redirects"));
+        return;
+      }
+      const request = https.get(followUrl, { signal: abort.signal }, (response) => {
+        if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          response.resume();
+          follow(response.headers.location, redirectCount + 1);
+          return;
+        }
+        if (response.statusCode !== 200) {
+          reject(new Error(`Download failed with status ${response.statusCode}`));
+          return;
+        }
+        const totalBytes = parseInt(response.headers["content-length"] || "0", 10);
+        let bytesDownloaded = 0;
+        const file = fs.createWriteStream(tempPath);
+        response.pipe(file);
+        response.on("data", (chunk) => {
+          bytesDownloaded += chunk.length;
+          if (onProgress && totalBytes > 0) {
+            onProgress(Math.round(bytesDownloaded / totalBytes * 100), bytesDownloaded, totalBytes);
+          }
+        });
+        file.on("finish", () => {
+          file.close(() => {
+            fs.renameSync(tempPath, destPath);
+            resolve();
+          });
+        });
+        file.on("error", (err) => {
+          file.close();
+          cleanup(tempPath);
+          reject(err);
+        });
+      });
+      request.on("error", (err) => {
+        cleanup(tempPath);
+        reject(err);
+      });
+    };
+    follow(url);
+  });
+}
+async function downloadModel(size, onProgress) {
+  const model = WHISPER_MODELS[size];
+  const destPath = getModelPath(size);
+  if (fs.existsSync(destPath)) {
+    await ensureVadModel();
+    return destPath;
+  }
+  const abort = new AbortController();
+  activeDownloadAbort = abort;
+  try {
+    await downloadFile(model.url, destPath, abort, onProgress);
+    await ensureVadModel();
+    return destPath;
+  } catch (err) {
+    cleanup(destPath + ".download");
+    throw err;
+  } finally {
+    if (activeDownloadAbort === abort) {
+      activeDownloadAbort = null;
+    }
+  }
+}
+async function ensureVadModel() {
+  const vadPath = getVadModelPath();
+  if (fs.existsSync(vadPath)) return;
+  console.log("[Whisper] Auto-downloading VAD model...");
+  const abort = new AbortController();
+  try {
+    await downloadFile(VAD_MODEL.url, vadPath, abort);
+    console.log("[Whisper] VAD model downloaded");
+  } catch (err) {
+    console.warn("[Whisper] Failed to download VAD model:", err);
+  }
+}
+function cleanup(path2) {
+  try {
+    if (fs.existsSync(path2)) fs.unlinkSync(path2);
+  } catch {
+  }
+}
+const whisperModels = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  VAD_MODEL,
+  WHISPER_MODELS,
+  cancelModelDownload,
+  deleteModel,
+  downloadModel,
+  ensureVadModel,
+  getDownloadedModels,
+  getModelPath,
+  getModelsDir,
+  getVadModelPath,
+  isModelDownloaded,
+  isVadModelDownloaded
+}, Symbol.toStringTag, { value: "Module" }));
+function getFfmpegPath() {
+  return require("ffmpeg-static");
+}
+async function convertToWhisperFormat(inputPath) {
+  const outputPath = path.join(os.tmpdir(), `hidock-whisper-${crypto$1.randomUUID()}.wav`);
+  const ffmpegPath = getFfmpegPath();
+  return new Promise((resolve, reject) => {
+    child_process.execFile(
+      ffmpegPath,
+      [
+        "-i",
+        inputPath,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        "-y",
+        outputPath
+      ],
+      { timeout: 12e4 },
+      (error2, _stdout, stderr) => {
+        if (error2) {
+          cleanupTempFile(outputPath);
+          reject(new Error(`Audio conversion failed: ${stderr || error2.message}`));
+          return;
+        }
+        resolve(outputPath);
+      }
+    );
+  });
+}
+function cleanupTempFile(path2) {
+  try {
+    if (fs.existsSync(path2)) fs.unlinkSync(path2);
+  } catch {
+  }
+}
+let activeContext = null;
+let activeModelSize = null;
+let activeStop = null;
+let vadContext = null;
+async function getVadSegments(wavPath, useGpu) {
+  try {
+    if (!isVadModelDownloaded()) {
+      await ensureVadModel();
+    }
+    if (!isVadModelDownloaded()) {
+      console.log("[Whisper] VAD model not available, skipping VAD");
+      return null;
+    }
+    if (!vadContext) {
+      vadContext = await whisper_node.initWhisperVad({
+        filePath: getVadModelPath(),
+        useGpu: false
+        // VAD model is tiny (<1MB), CPU is fine and avoids Metal backend conflicts
+      });
+    }
+    const segments = await vadContext.detectSpeechFile(wavPath, {
+      threshold: 0.5,
+      minSpeechDurationMs: 500,
+      minSilenceDurationMs: 300,
+      speechPadMs: 200
+    });
+    console.log(`[Whisper] VAD detected ${segments.length} speech segments`);
+    return segments;
+  } catch (err) {
+    console.warn("[Whisper] VAD failed, proceeding without:", err);
+    return null;
+  }
+}
+async function transcribeWithWhisper(audioFilePath, config2, progressCallback) {
+  if (!isModelDownloaded(config2.modelSize)) {
+    throw new Error(
+      `Whisper model "${config2.modelSize}" is not downloaded. Please download it in Settings first.`
+    );
+  }
+  const modelPath = getModelPath(config2.modelSize);
+  let tempWavPath = null;
+  try {
+    progressCallback?.("converting", 5);
+    tempWavPath = await convertToWhisperFormat(audioFilePath);
+    progressCallback?.("detecting_speech", 8);
+    const vadSegments = await getVadSegments(tempWavPath, config2.useGpu);
+    progressCallback?.("loading_model", 10);
+    if (!activeContext || activeModelSize !== config2.modelSize) {
+      if (activeContext) await activeContext.release();
+      activeContext = await whisper_node.initWhisper({
+        filePath: modelPath,
+        useGpu: config2.useGpu
+      });
+      activeModelSize = config2.modelSize;
+    }
+    progressCallback?.("transcribing", 15);
+    if (vadSegments && vadSegments.length > 0) {
+      return await transcribeWithVadSegments(tempWavPath, config2, vadSegments, progressCallback);
+    }
+    return await transcribeFullFile(tempWavPath, config2, progressCallback);
+  } finally {
+    if (tempWavPath) {
+      cleanupTempFile(tempWavPath);
+    }
+  }
+}
+async function transcribeFullFile(wavPath, config2, progressCallback) {
+  const { stop, promise } = activeContext.transcribeFile(wavPath, {
+    language: config2.language === "auto" ? void 0 : config2.language,
+    temperature: 0,
+    temperatureInc: 0.2,
+    onProgress: (progress) => {
+      const mapped = 15 + Math.round(progress * 0.75);
+      progressCallback?.("transcribing", mapped);
+    }
+  });
+  activeStop = stop;
+  const result = await promise;
+  activeStop = null;
+  if (result.isAborted) throw new Error("Transcription was cancelled");
+  progressCallback?.("transcribing", 95);
+  return {
+    text: result.result,
+    language: result.language || config2.language,
+    segments: result.segments
+  };
+}
+async function transcribeWithVadSegments(wavPath, config2, vadSegments, progressCallback) {
+  const allSegments = [];
+  const textParts = [];
+  let detectedLanguage = config2.language;
+  for (let i = 0; i < vadSegments.length; i++) {
+    const vad = vadSegments[i];
+    const progressBase = 15 + Math.round(i / vadSegments.length * 75);
+    progressCallback?.("transcribing", progressBase);
+    const offsetMs = vad.t0 * 10;
+    const durationMs = (vad.t1 - vad.t0) * 10;
+    const offsetSec = Math.floor(offsetMs / 1e3);
+    const durationSec = Math.ceil(durationMs / 1e3) + 1;
+    const { stop, promise } = activeContext.transcribeFile(wavPath, {
+      language: config2.language === "auto" ? void 0 : config2.language,
+      temperature: 0,
+      temperatureInc: 0.2,
+      offset: offsetSec * 1e3,
+      // whisper expects milliseconds
+      duration: durationSec * 1e3,
+      onProgress: (progress) => {
+        const segProgress = progressBase + Math.round(progress / 100 * (75 / vadSegments.length));
+        progressCallback?.("transcribing", Math.min(segProgress, 90));
+      }
+    });
+    activeStop = stop;
+    const result = await promise;
+    activeStop = null;
+    if (result.isAborted) throw new Error("Transcription was cancelled");
+    if (result.result.trim()) {
+      textParts.push(result.result.trim());
+      allSegments.push(...result.segments);
+    }
+    if (result.language) detectedLanguage = result.language;
+  }
+  progressCallback?.("transcribing", 95);
+  return {
+    text: textParts.join(" "),
+    language: detectedLanguage,
+    segments: allSegments
+  };
+}
+async function cancelWhisperTranscription() {
+  if (activeStop) {
+    await activeStop();
+    activeStop = null;
+  }
+}
 function cosineSimilarity(a, b) {
   if (a.length !== b.length) return 0;
   let dotProduct = 0;
@@ -4203,12 +4659,16 @@ class VectorStore {
   }
   async indexTranscript(transcript, metadata) {
     if (metadata.recordingId) {
-      const existing = Array.from(this.documents.values()).filter(
-        (d) => d.metadata.recordingId === metadata.recordingId
+      const existing = Array.from(this.documents.entries()).filter(
+        ([, d]) => d.metadata.recordingId === metadata.recordingId
       );
       if (existing.length > 0) {
-        console.log(`Transcript ${metadata.recordingId} already indexed`);
-        return 0;
+        console.log(`Removing ${existing.length} old chunks for ${metadata.recordingId} before re-indexing`);
+        for (const [id] of existing) {
+          this.documents.delete(id);
+        }
+        const db2 = getDatabase();
+        db2.run("DELETE FROM vector_embeddings WHERE recording_id = ?", [metadata.recordingId]);
       }
     }
     const chunks = chunkText(transcript);
@@ -4311,6 +4771,7 @@ const readFileAsync = util.promisify(fs.readFile);
 let mainWindow$1 = null;
 let isProcessing = false;
 let processingInterval = null;
+let lastSkipLogAt = 0;
 function setMainWindowForTranscription(win) {
   mainWindow$1 = win;
 }
@@ -4337,6 +4798,8 @@ let cancelRequested = false;
 function cancelTranscription(recordingId) {
   removeFromQueueByRecordingId(recordingId);
   updateRecordingTranscriptionStatus(recordingId, "none");
+  cancelWhisperTranscription().catch(() => {
+  });
   notifyRenderer("transcription:cancelled", { recordingId });
 }
 function cancelAllTranscriptions() {
@@ -4351,28 +4814,11 @@ async function processQueue() {
   const processId = `proc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
   const lockAcquired = acquireTranscriptionLock(processId);
   if (!lockAcquired) {
-    console.log("[Transcription] Another process is already processing the queue, skipping");
-    return;
-  }
-  const config2 = getConfig();
-  if (!config2.transcription.geminiApiKey) {
-    console.error("[Transcription] Cannot process queue: Gemini API key not configured");
-    const pendingItems = getQueueItems("pending");
-    const processingItems = getQueueItems("processing");
-    const allStuckItems = [...pendingItems, ...processingItems];
-    if (allStuckItems.length > 0) {
-      console.log(`[Transcription] Marking ${allStuckItems.length} stuck items as failed (no API key)`);
-      for (const item of allStuckItems) {
-        updateQueueItem(item.id, "failed", "Gemini API key not configured. Please add your API key in Settings.");
-        updateRecordingTranscriptionStatus(item.recording_id, "error");
-        notifyRenderer("transcription:failed", {
-          queueItemId: item.id,
-          recordingId: item.recording_id,
-          error: "Gemini API key not configured. Please add your API key in Settings."
-        });
-      }
+    const now = Date.now();
+    if (now - lastSkipLogAt > 6e4) {
+      console.log("[Transcription] Another process is already processing the queue, skipping");
+      lastSkipLogAt = now;
     }
-    releaseTranscriptionLock(processId);
     return;
   }
   try {
@@ -4418,10 +4864,10 @@ async function processQueue() {
         updateQueueItem(item.id, "processing");
         updateQueueProgress(item.id, 0);
         notifyRenderer("transcription:started", { queueItemId: item.id, recordingId: item.recording_id });
-        const { emitActivityLog } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
+        const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
         const recording = getRecordingById(item.recording_id);
         const filename = recording?.filename ?? item.recording_id;
-        emitActivityLog("info", "Transcribing recording", filename);
+        emitActivityLog2("info", "Transcribing recording", filename);
         let tickerProgress = 0;
         const progressTicker = setInterval(() => {
           if (tickerProgress < 90) {
@@ -4446,14 +4892,19 @@ async function processQueue() {
           });
         };
         try {
-          await transcribeRecording(item.recording_id, progressCallback);
+          const itemOverrides = {
+            provider: item.override_provider || void 0,
+            model: item.override_model || void 0,
+            language: item.override_language || void 0
+          };
+          await transcribeRecording(item.recording_id, progressCallback, itemOverrides);
         } finally {
           clearInterval(progressTicker);
         }
         updateQueueProgress(item.id, 100);
         updateQueueItem(item.id, "completed");
         notifyRenderer("transcription:completed", { queueItemId: item.id, recordingId: item.recording_id });
-        const { emitActivityLog: emitDone } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
+        const { emitActivityLog: emitDone } = await Promise.resolve().then(() => activityLog);
         const recDone = getRecordingById(item.recording_id);
         emitDone("success", "Transcription complete", recDone?.filename ?? item.recording_id);
       } catch (error2) {
@@ -4466,7 +4917,7 @@ async function processQueue() {
           recordingId: item.recording_id,
           error: errorMessage
         });
-        const { emitActivityLog: emitFail } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
+        const { emitActivityLog: emitFail } = await Promise.resolve().then(() => activityLog);
         const recFail = getRecordingById(item.recording_id);
         emitFail("error", "Transcription failed", `${recFail?.filename ?? item.recording_id}: ${errorMessage}`);
         const retryCount = item.retry_count ?? 0;
@@ -4484,10 +4935,35 @@ async function processQueue() {
 async function processQueueManually() {
   return processQueue();
 }
+async function generateWithAI(prompt) {
+  const config2 = getConfig();
+  if (config2.chat.provider === "ollama") {
+    try {
+      const ollama = getOllamaService();
+      const isAvailable = await ollama.isAvailable();
+      if (isAvailable) {
+        const result = await ollama.generate(prompt, "You are a helpful AI assistant that analyzes meeting transcripts. Always respond with valid JSON.");
+        return result;
+      }
+      console.warn("[AI] Ollama configured but not available, falling back to Gemini");
+    } catch (e) {
+      console.warn("[AI] Ollama error, falling back to Gemini:", e instanceof Error ? e.message : e);
+    }
+  }
+  if (config2.transcription.geminiApiKey) {
+    const genAI = new generativeAi.GoogleGenerativeAI(config2.transcription.geminiApiKey);
+    const model = genAI.getGenerativeModel({ model: config2.transcription.geminiModel || "gemini-2.0-flash-exp" });
+    const result = await model.generateContent(prompt);
+    return result.response.text();
+  }
+  return null;
+}
 async function detectActionables(transcriptText, knowledgeCaptureId, metadata) {
   const config2 = getConfig();
-  if (!config2.transcription.geminiApiKey) {
-    console.log("[Actionable Detection] Gemini API key not configured, skipping");
+  const hasGemini = !!config2.transcription.geminiApiKey;
+  const hasOllama = config2.chat.provider === "ollama";
+  if (!hasGemini && !hasOllama) {
+    console.log("[Actionable Detection] No AI provider configured, skipping");
     return [];
   }
   const wordCount = transcriptText.split(/\s+/).filter((w) => w.length > 0).length;
@@ -4524,10 +5000,11 @@ For each detected intent, return:
 Return as JSON array. If no actionables detected, return empty array [].
 Only include detections with confidence >= 0.6.`;
   try {
-    const genAI = new generativeAi.GoogleGenerativeAI(config2.transcription.geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: config2.transcription.geminiModel || "gemini-2.0-flash-exp" });
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
+    const responseText = await generateWithAI(prompt);
+    if (!responseText) {
+      console.log("[Actionable Detection] No AI provider available");
+      return [];
+    }
     const jsonMatch = responseText.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       console.log("[Actionable Detection] No JSON array found in response");
@@ -4542,24 +5019,35 @@ Only include detections with confidence >= 0.6.`;
     return [];
   }
 }
-async function transcribeRecording(recordingId, progressCallback) {
-  const recording = getRecordingById(recordingId);
-  if (!recording || !recording.file_path) {
-    throw new Error(`Recording not found or no local file: ${recordingId}`);
-  }
-  if (!fs.existsSync(recording.file_path)) {
-    throw new Error(`Recording file not found: ${recording.file_path}`);
-  }
+async function getTranscriptText(filePath, progressCallback, overrides) {
   const config2 = getConfig();
+  const effectiveProvider = overrides?.provider || config2.transcription.provider;
+  if (effectiveProvider === "whisper") {
+    const effectiveModel = overrides?.model || config2.transcription.whisperModelSize;
+    const effectiveLanguage2 = overrides?.language || config2.transcription.whisperLanguage;
+    const result = await transcribeWithWhisper(
+      filePath,
+      {
+        modelSize: effectiveModel,
+        language: effectiveLanguage2,
+        useGpu: config2.transcription.whisperUseGpu
+      },
+      progressCallback
+    );
+    return {
+      fullText: result.text,
+      language: result.language,
+      provider: "whisper",
+      model: `whisper-${effectiveModel}`
+    };
+  }
   if (!config2.transcription.geminiApiKey) {
     throw new Error("Gemini API key not configured");
   }
-  console.log(`Transcribing: ${recording.filename}`);
-  updateRecordingTranscriptionStatus(recordingId, "processing");
   progressCallback?.("reading_file", 5);
-  const audioBuffer = await readFileAsync(recording.file_path);
+  const audioBuffer = await readFileAsync(filePath);
   const base64Audio = audioBuffer.toString("base64");
-  const ext = path.extname(recording.file_path).toLowerCase();
+  const ext = path.extname(filePath).toLowerCase();
   const mimeTypes = {
     ".wav": "audio/wav",
     ".mp3": "audio/mp3",
@@ -4567,32 +5055,18 @@ async function transcribeRecording(recordingId, progressCallback) {
     ".ogg": "audio/ogg",
     ".webm": "audio/webm",
     ".hda": "audio/mp3"
-    // HiDock H1E outputs MPEG MP3 format
   };
   const mimeType = mimeTypes[ext] || "audio/wav";
+  const effectiveGeminiModel = overrides?.model || config2.transcription.geminiModel || "gemini-2.0-flash-exp";
   const genAI = new generativeAi.GoogleGenerativeAI(config2.transcription.geminiApiKey);
-  const model = genAI.getGenerativeModel({ model: config2.transcription.geminiModel || "gemini-2.0-flash-exp" });
-  const candidateMeetings = findCandidateMeetingsForRecording(recordingId);
-  console.log(`Found ${candidateMeetings.length} candidate meetings for recording ${recordingId}`);
-  let meetingContext = "";
-  if (candidateMeetings.length > 0) {
-    meetingContext = `
-
-POSSIBLE MEETING CONTEXT (use this to improve transcription accuracy):
-${candidateMeetings.map((m, i) => `
-Meeting ${i + 1}: "${m.subject}"
-  Time: ${new Date(m.start_time).toLocaleString()} - ${new Date(m.end_time).toLocaleString()}
-  ${m.organizer_name ? `Organizer: ${m.organizer_name}` : ""}
-  ${m.location ? `Location: ${m.location}` : ""}
-  ${m.description ? `Description: ${m.description.slice(0, 200)}...` : ""}
-`).join("\n")}`;
-  }
+  const model = genAI.getGenerativeModel({ model: effectiveGeminiModel });
   progressCallback?.("transcribing", 20);
+  const effectiveLanguage = overrides?.language || config2.transcription.language || "";
+  const languageHint = effectiveLanguage && effectiveLanguage !== "auto" ? `The audio is in ${effectiveLanguage}. Transcribe in the original language.` : "The audio may be in any language - transcribe in the original language.";
   const transcriptionPrompt = `Transcribe this audio recording.
-The audio may be in Spanish or English - transcribe in the original language.
+${languageHint}
 Provide a clean, accurate transcription of all speech.
 If there are multiple speakers, try to indicate speaker changes with "Speaker 1:", "Speaker 2:", etc.
-${meetingContext}
 Return ONLY the transcription, no additional commentary.`;
   const transcriptionResult = await model.generateContent([
     {
@@ -4603,8 +5077,21 @@ Return ONLY the transcription, no additional commentary.`;
     },
     { text: transcriptionPrompt }
   ]);
-  const fullText = transcriptionResult.response.text();
-  progressCallback?.("analyzing", 50);
+  return {
+    fullText: transcriptionResult.response.text(),
+    language: effectiveLanguage || "unknown",
+    provider: "gemini",
+    model: effectiveGeminiModel
+  };
+}
+async function analyzeTranscript(fullText, recordingId, candidateMeetings) {
+  const config2 = getConfig();
+  const hasGemini = !!config2.transcription.geminiApiKey;
+  const hasOllama = config2.chat.provider === "ollama";
+  if (!hasGemini && !hasOllama) {
+    console.log("[Transcription] No AI provider available — skipping AI analysis");
+    return {};
+  }
   let meetingSelectionSection = "";
   if (candidateMeetings.length > 1) {
     meetingSelectionSection = `
@@ -4654,18 +5141,46 @@ Respond in JSON format:
   "meeting_confidence": 0.0,
   "selection_reason": "..."` : ""}
 }`;
-  const analysisResult = await model.generateContent(analysisPrompt);
-  const analysisText = analysisResult.response.text();
-  let analysis = {};
   try {
-    const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      analysis = JSON.parse(jsonMatch[0]);
+    const analysisText = await generateWithAI(analysisPrompt);
+    if (!analysisText) {
+      console.log("[Transcription] No AI provider available for analysis");
+      return {};
+    }
+    try {
+      const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.warn("Failed to parse analysis JSON:", e);
     }
   } catch (e) {
-    console.warn("Failed to parse analysis JSON:", e);
-    analysis = { summary: "Analysis failed", language: "unknown" };
+    console.warn("[Transcription] AI analysis failed (transcript still saved):", e instanceof Error ? e.message : e);
   }
+  return {};
+}
+async function transcribeRecording(recordingId, progressCallback, overrides) {
+  const recording = getRecordingById(recordingId);
+  if (!recording || !recording.file_path) {
+    throw new Error(`Recording not found or no local file: ${recordingId}`);
+  }
+  if (!fs.existsSync(recording.file_path)) {
+    throw new Error(`Recording file not found: ${recording.file_path}`);
+  }
+  const config2 = getConfig();
+  const effectiveProvider = overrides?.provider || config2.transcription.provider;
+  console.log(`Transcribing (${effectiveProvider}): ${recording.filename}`);
+  updateRecordingTranscriptionStatus(recordingId, "processing");
+  const { fullText, language, provider, model: transcriptionModel } = await getTranscriptText(
+    recording.file_path,
+    progressCallback,
+    overrides
+  );
+  progressCallback?.("analyzing", 50);
+  const candidateMeetings = findCandidateMeetingsForRecording(recordingId);
+  console.log(`Found ${candidateMeetings.length} candidate meetings for recording ${recordingId}`);
+  const analysis = await analyzeTranscript(fullText, recordingId, candidateMeetings);
   if (candidateMeetings.length > 0) {
     for (const meeting of candidateMeetings) {
       const isSelected = analysis.selected_meeting_id === meeting.id;
@@ -4691,14 +5206,14 @@ Respond in JSON format:
     id: `trans_${recordingId}`,
     recording_id: recordingId,
     full_text: fullText,
-    language: analysis.language || "unknown",
+    language: analysis.language || language || "unknown",
     summary: analysis.summary,
     action_items: analysis.action_items ? JSON.stringify(analysis.action_items) : void 0,
     topics: analysis.topics ? JSON.stringify(analysis.topics) : void 0,
     key_points: analysis.key_points ? JSON.stringify(analysis.key_points) : void 0,
     word_count: wordCount,
-    transcription_provider: "gemini",
-    transcription_model: config2.transcription.geminiModel,
+    transcription_provider: provider,
+    transcription_model: transcriptionModel,
     title_suggestion: analysis.title_suggestion,
     question_suggestions: analysis.question_suggestions ? JSON.stringify(analysis.question_suggestions) : void 0
   };
@@ -4730,7 +5245,6 @@ Respond in JSON format:
         [
           actionableId,
           sourceKnowledgeId,
-          // source_knowledge_id references knowledge_captures.id
           detection.type,
           detection.suggestedTitle,
           detection.reason,
@@ -4814,6 +5328,14 @@ function registerRecordingHandlers() {
       return [];
     }
   });
+  electron.ipcMain.handle("recordings:getDeletedFilenames", async () => {
+    try {
+      return getDeletedRecordingFilenames();
+    } catch (error2) {
+      console.error("recordings:getDeletedFilenames error:", error2);
+      return [];
+    }
+  });
   electron.ipcMain.handle("recordings:getById", async (_, id) => {
     try {
       const result = GetRecordingByIdSchema.safeParse({ id });
@@ -4867,14 +5389,19 @@ function registerRecordingHandlers() {
         return false;
       }
       const recording = getRecordingById(result.data.id);
-      if (recording && recording.file_path) {
-        const deleted = deleteRecording(recording.file_path);
-        if (deleted) {
-          updateRecordingStatus(result.data.id, "deleted");
-        }
-        return deleted;
+      if (!recording) {
+        console.log("recordings:delete: recording not found:", result.data.id);
+        return false;
       }
-      return false;
+      if (recording.file_path) {
+        try {
+          deleteRecording(recording.file_path);
+        } catch (e) {
+          console.warn("recordings:delete: failed to delete file:", e);
+        }
+      }
+      updateRecordingStatus(result.data.id, "deleted");
+      return true;
     } catch (error2) {
       console.error("recordings:delete error:", error2);
       return false;
@@ -5042,24 +5569,26 @@ function registerRecordingHandlers() {
       const result = GetRecordingByIdSchema.safeParse({ id: recordingId });
       if (!result.success) {
         console.error("recordings:getCandidates validation error:", result.error);
-        return [];
+        return { success: false, data: [], error: "Invalid recording ID" };
       }
-      return getCandidatesForRecordingWithDetails(result.data.id);
+      const data = getCandidatesForRecordingWithDetails(result.data.id);
+      return { success: true, data };
     } catch (error2) {
       console.error("recordings:getCandidates error:", error2);
-      return [];
+      return { success: false, data: [], error: error2 instanceof Error ? error2.message : "Unknown error" };
     }
   });
   electron.ipcMain.handle("recordings:getMeetingsNearDate", async (_, dateStr) => {
     try {
       if (typeof dateStr !== "string") {
         console.error("recordings:getMeetingsNearDate invalid date:", dateStr);
-        return [];
+        return { success: false, data: [], error: "Invalid date" };
       }
-      return getMeetingsNearDate(dateStr);
+      const data = getMeetingsNearDate(dateStr);
+      return { success: true, data };
     } catch (error2) {
       console.error("recordings:getMeetingsNearDate error:", error2);
-      return [];
+      return { success: false, data: [], error: error2 instanceof Error ? error2.message : "Unknown error" };
     }
   });
   electron.ipcMain.handle("recordings:addExternal", async () => {
@@ -5188,24 +5717,38 @@ function registerRecordingHandlers() {
       return { success: false, error: error2.message };
     }
   });
-  electron.ipcMain.handle("recordings:addToQueue", async (_, recordingId) => {
-    try {
-      const config2 = getConfig();
-      if (!config2.transcription.geminiApiKey) {
-        return {
-          success: false,
-          error: "Transcription API key not configured. Please add your API key in Settings."
-        };
+  electron.ipcMain.handle(
+    "recordings:addToQueue",
+    async (_, recordingId, overrides) => {
+      try {
+        const config2 = getConfig();
+        const effectiveProvider = overrides?.provider || config2.transcription.provider;
+        if (effectiveProvider === "gemini" && !config2.transcription.geminiApiKey) {
+          return {
+            success: false,
+            error: "Transcription API key not configured. Please add your API key in Settings."
+          };
+        }
+        if (effectiveProvider === "whisper") {
+          const { isModelDownloaded: isModelDownloaded2 } = await Promise.resolve().then(() => whisperModels);
+          const effectiveModel = overrides?.model || config2.transcription.whisperModelSize;
+          if (!isModelDownloaded2(effectiveModel)) {
+            return {
+              success: false,
+              error: `Whisper model "${effectiveModel}" not downloaded. Please download it in Settings.`
+            };
+          }
+        }
+        const queueItemId = addToQueue(recordingId, overrides);
+        updateRecordingTranscriptionStatus(recordingId, "queued");
+        processQueueManually();
+        return queueItemId;
+      } catch (error2) {
+        console.error("recordings:addToQueue error:", error2);
+        return false;
       }
-      const queueItemId = addToQueue(recordingId);
-      updateRecordingTranscriptionStatus(recordingId, "queued");
-      processQueueManually();
-      return queueItemId;
-    } catch (error2) {
-      console.error("recordings:addToQueue error:", error2);
-      return false;
     }
-  });
+  );
   electron.ipcMain.handle("recordings:processQueue", async () => {
     try {
       startTranscriptionProcessor();
@@ -5265,6 +5808,84 @@ function registerRecordingHandlers() {
     } catch (error2) {
       console.error("recordings:updateTranscriptionStatus error:", error2);
       return { success: false, error: error2 instanceof Error ? error2.message : "Unknown error occurred" };
+    }
+  });
+  electron.ipcMain.handle("recordings:updateDisplayName", async (_, id, displayName) => {
+    try {
+      if (!id || typeof id !== "string") {
+        return { success: false, error: "Invalid recording ID" };
+      }
+      updateRecordingDisplayName(id, displayName);
+      return { success: true };
+    } catch (error2) {
+      console.error("recordings:updateDisplayName error:", error2);
+      return { success: false, error: error2 instanceof Error ? error2.message : "Unknown error" };
+    }
+  });
+  electron.ipcMain.handle("whisper:getDownloadedModels", async () => {
+    try {
+      const { getDownloadedModels: getDownloadedModels2 } = await Promise.resolve().then(() => whisperModels);
+      return { success: true, models: getDownloadedModels2() };
+    } catch (error2) {
+      console.error("whisper:getDownloadedModels error:", error2);
+      return { success: false, models: [], error: error2.message };
+    }
+  });
+  electron.ipcMain.handle("whisper:getModelStatus", async (_, modelSize) => {
+    try {
+      const { isModelDownloaded: isModelDownloaded2, getModelPath: getModelPath2, WHISPER_MODELS: WHISPER_MODELS2 } = await Promise.resolve().then(() => whisperModels);
+      const size = modelSize;
+      const info = WHISPER_MODELS2[size];
+      if (!info) return { success: false, error: `Unknown model size: ${modelSize}` };
+      return {
+        success: true,
+        downloaded: isModelDownloaded2(size),
+        path: getModelPath2(size),
+        approxMB: info.approxMB
+      };
+    } catch (error2) {
+      console.error("whisper:getModelStatus error:", error2);
+      return { success: false, error: error2.message };
+    }
+  });
+  electron.ipcMain.handle("whisper:downloadModel", async (event, modelSize) => {
+    try {
+      const { downloadModel: downloadModel2 } = await Promise.resolve().then(() => whisperModels);
+      const size = modelSize;
+      const mainWin = electron.BrowserWindow.fromWebContents(event.sender);
+      await downloadModel2(size, (progress, bytesDownloaded, totalBytes) => {
+        mainWin?.webContents.send("whisper:download-progress", {
+          modelSize: size,
+          progress,
+          bytesDownloaded,
+          totalBytes
+        });
+      });
+      return { success: true };
+    } catch (error2) {
+      console.error("whisper:downloadModel error:", error2);
+      return { success: false, error: error2.message };
+    }
+  });
+  electron.ipcMain.handle("whisper:cancelDownload", async () => {
+    try {
+      const { cancelModelDownload: cancelModelDownload2 } = await Promise.resolve().then(() => whisperModels);
+      cancelModelDownload2();
+      return { success: true };
+    } catch (error2) {
+      console.error("whisper:cancelDownload error:", error2);
+      return { success: false, error: error2.message };
+    }
+  });
+  electron.ipcMain.handle("whisper:deleteModel", async (_, modelSize) => {
+    try {
+      const { deleteModel: deleteModel2 } = await Promise.resolve().then(() => whisperModels);
+      const size = modelSize;
+      const deleted = deleteModel2(size);
+      return { success: true, deleted };
+    } catch (error2) {
+      console.error("whisper:deleteModel error:", error2);
+      return { success: false, error: error2.message };
     }
   });
   console.log("Recording IPC handlers registered");
@@ -5707,7 +6328,7 @@ function getRAGService() {
   }
   return ragInstance;
 }
-const UUIDSchema = zod.z.string().uuid();
+const UUIDSchema = zod.z.string().min(1, "ID must not be empty").max(500);
 const DateTimeSchema = zod.z.string().datetime({ offset: true }).or(zod.z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/));
 zod.z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const NonEmptyStringSchema = zod.z.string().min(1).max(1e3);
@@ -6581,18 +7202,28 @@ ${transcript.full_text}`);
       };
     } else if (options.knowledgeCaptureId) {
       const kc = queryOne("SELECT * FROM knowledge_captures WHERE id = ?", [options.knowledgeCaptureId]);
-      if (!kc) {
-        throw new Error(`Knowledge capture not found: ${options.knowledgeCaptureId}`);
+      if (kc) {
+        const transcript = getTranscriptByRecordingId(kc.source_recording_id);
+        if (transcript?.full_text) {
+          transcripts.push(transcript.full_text);
+        }
+        contextInfo = {
+          capture_title: kc.title,
+          capture_date: new Date(kc.captured_at).toLocaleDateString(),
+          capture_summary: kc.summary || ""
+        };
+      } else {
+        const transcript = getTranscriptByRecordingId(options.knowledgeCaptureId);
+        if (transcript?.full_text) {
+          transcripts.push(transcript.full_text);
+        }
+        const recording = queryOne("SELECT * FROM recordings WHERE id = ?", [options.knowledgeCaptureId]);
+        contextInfo = {
+          capture_title: recording?.filename || "Recording",
+          capture_date: recording?.date_recorded ? new Date(recording.date_recorded).toLocaleDateString() : (/* @__PURE__ */ new Date()).toLocaleDateString(),
+          capture_summary: ""
+        };
       }
-      const transcript = getTranscriptByRecordingId(kc.source_recording_id);
-      if (transcript?.full_text) {
-        transcripts.push(transcript.full_text);
-      }
-      contextInfo = {
-        capture_title: kc.title,
-        capture_date: new Date(kc.captured_at).toLocaleDateString(),
-        capture_summary: kc.summary || ""
-      };
     }
     if (transcripts.length === 0) {
       throw new Error("No transcripts available for the selected context");
@@ -8592,6 +9223,16 @@ class DownloadService {
       this.persistQueueItem(item);
       this.markDirty();
       this.emitStateUpdate(true);
+      if (item.fileSize && item.fileSize > 0 && data.length !== item.fileSize) {
+        const errMsg = `File size mismatch: expected ${item.fileSize} bytes, received ${data.length} bytes`;
+        console.error(`[DownloadService] Integrity check failed: ${filename} — ${errMsg}`);
+        item.status = "failed";
+        item.error = errMsg;
+        this.persistQueueItem(item);
+        this.markDirty();
+        this.emitStateUpdate(true);
+        return { success: false, error: errMsg };
+      }
       const filePath = await saveRecording(filename, data, void 0, item.recordingDate);
       const wavFilename = filename.replace(/\.hda$/i, ".wav");
       addSyncedFile(filename, path.basename(filePath), filePath, data.length);
@@ -8648,6 +9289,7 @@ class DownloadService {
     item.status = "cancelled";
     item.error = "Cancelled by user";
     this.persistQueueItem(item);
+    emitActivityLog("info", `Download cancelled: ${filename}`);
     console.log(`[DownloadService] Cancelled download: ${filename}`);
     this.markDirty();
     this.emitStateUpdate(true);
@@ -8691,6 +9333,7 @@ class DownloadService {
       item.status = "failed";
       item.error = error2;
       this.persistQueueItem(item);
+      emitActivityLog("error", `Download failed: ${filename}`, error2);
       if (this.state.currentSession) {
         this.state.currentSession.failedFiles++;
       }
@@ -8730,10 +9373,12 @@ class DownloadService {
           stallTimeout = STALL_TIMEOUT_DEFAULT_MS;
         }
         if (elapsed > stallTimeout) {
+          const stallMsg = `Download stalled (${Math.round(elapsed / 1e3)}s without data)`;
           console.warn(`[DownloadService] Stall detected for ${item.filename} (${Math.round(elapsed / 1e3)}s without progress, timeout=${stallTimeout / 1e3}s, size=${item.fileSize})`);
           item.status = "failed";
-          item.error = `Download stalled (${Math.round(elapsed / 1e3)}s without data)`;
+          item.error = stallMsg;
           this.persistQueueItem(item);
+          emitActivityLog("warning", `Download stalled: ${item.filename}`, stallMsg);
           if (this.state.currentSession) {
             this.state.currentSession.failedFiles++;
           }
@@ -8902,6 +9547,7 @@ class DownloadService {
             this.persistQueueItem(item);
           }
         });
+        emitActivityLog("info", "All downloads cancelled", `${itemsToCancel.length} items`);
       }
       if (this.state.currentSession) {
         this.state.currentSession.status = "cancelled";
@@ -10187,13 +10833,11 @@ function registerAssistantHandlers() {
       }
       const id = crypto$1.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
-      runInTransaction(() => {
-        run(
-          "INSERT INTO chat_messages (id, conversation_id, role, content, sources, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-          [id, conversationId, role, content, sources || null, now]
-        );
-        run("UPDATE conversations SET updated_at = ? WHERE id = ?", [now, conversationId]);
-      });
+      run(
+        "INSERT INTO chat_messages (id, conversation_id, role, content, sources, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        [id, conversationId, role, content, sources || null, now]
+      );
+      run("UPDATE conversations SET updated_at = ? WHERE id = ?", [now, conversationId]);
       const newMessage = queryOne(`SELECT ${MESSAGE_COLUMNS} FROM chat_messages WHERE id = ?`, [id]);
       return mapToMessage(newMessage);
     } catch (error2) {
@@ -10208,15 +10852,21 @@ function registerAssistantHandlers() {
         console.error(`addContext: Conversation ${conversationId} not found`);
         return { success: false, error: "Conversation not found" };
       }
+      let kcId = knowledgeCaptureId;
       const kc = queryOne("SELECT id FROM knowledge_captures WHERE id = ?", [knowledgeCaptureId]);
       if (!kc) {
-        console.error(`addContext: Knowledge capture ${knowledgeCaptureId} not found`);
-        return { success: false, error: "Knowledge capture not found" };
+        const kcByRecording = queryOne("SELECT id FROM knowledge_captures WHERE source_recording_id = ?", [knowledgeCaptureId]);
+        if (kcByRecording) {
+          kcId = kcByRecording.id;
+        } else {
+          console.log(`addContext: No knowledge capture for ${knowledgeCaptureId}, skipping context link`);
+          return { success: true };
+        }
       }
       const id = crypto$1.randomUUID();
       run(
         "INSERT OR IGNORE INTO conversation_context (id, conversation_id, knowledge_capture_id) VALUES (?, ?, ?)",
-        [id, conversationId, knowledgeCaptureId]
+        [id, conversationId, kcId]
       );
       return { success: true };
     } catch (error2) {
@@ -10647,6 +11297,7 @@ async function initializeServices() {
   console.log("Storage policy service initialized");
   registerIpcHandlers();
   console.log("IPC handlers registered");
+  initializeCalendarAutoSync();
   updateSplashStatus("Starting application...", 100);
 }
 electron.app.commandLine.appendSwitch("disable-usb-blocklist");

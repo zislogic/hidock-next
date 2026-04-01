@@ -1,6 +1,6 @@
 
 import { ipcMain } from 'electron'
-import { queryAll, queryOne, run, runInTransaction } from '../services/database'
+import { queryAll, queryOne, run } from '../services/database'
 import { getRAGService } from '../services/rag'
 import type { Conversation, Message } from '@/types/knowledge'
 import { randomUUID } from 'crypto'
@@ -85,13 +85,11 @@ export function registerAssistantHandlers(): void {
       const id = randomUUID()
       const now = new Date().toISOString()
 
-      runInTransaction(() => {
-        run('INSERT INTO chat_messages (id, conversation_id, role, content, sources, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          [id, conversationId, role, content, sources || null, now])
+      run('INSERT INTO chat_messages (id, conversation_id, role, content, sources, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [id, conversationId, role, content, sources || null, now])
 
-        // Update conversation's updated_at timestamp
-        run('UPDATE conversations SET updated_at = ? WHERE id = ?', [now, conversationId])
-      })
+      // Update conversation's updated_at timestamp
+      run('UPDATE conversations SET updated_at = ? WHERE id = ?', [now, conversationId])
 
       const newMessage = queryOne<any>(`SELECT ${MESSAGE_COLUMNS} FROM chat_messages WHERE id = ?`, [id])
       return mapToMessage(newMessage)
@@ -111,15 +109,24 @@ export function registerAssistantHandlers(): void {
         return { success: false, error: 'Conversation not found' }
       }
 
+      // Try as knowledge capture first, then fall back to finding one by recording ID
+      let kcId = knowledgeCaptureId
       const kc = queryOne<any>('SELECT id FROM knowledge_captures WHERE id = ?', [knowledgeCaptureId])
       if (!kc) {
-        console.error(`addContext: Knowledge capture ${knowledgeCaptureId} not found`)
-        return { success: false, error: 'Knowledge capture not found' }
+        // Fall back: find knowledge capture by source recording ID
+        const kcByRecording = queryOne<any>('SELECT id FROM knowledge_captures WHERE source_recording_id = ?', [knowledgeCaptureId])
+        if (kcByRecording) {
+          kcId = kcByRecording.id
+        } else {
+          // No knowledge capture exists — skip silently (context will work without it)
+          console.log(`addContext: No knowledge capture for ${knowledgeCaptureId}, skipping context link`)
+          return { success: true }
+        }
       }
 
       const id = randomUUID()
       run('INSERT OR IGNORE INTO conversation_context (id, conversation_id, knowledge_capture_id) VALUES (?, ?, ?)',
-        [id, conversationId, knowledgeCaptureId])
+        [id, conversationId, kcId])
       return { success: true }
     } catch (error) {
       console.error('Failed to add context:', error)

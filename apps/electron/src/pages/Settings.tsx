@@ -41,6 +41,7 @@ export function Settings() {
   const [whisperDownloadProgress, setWhisperDownloadProgress] = useState<number | null>(null)
   const [chatProvider, setChatProvider] = useState<'gemini' | 'ollama'>('gemini')
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434')
+  const [ollamaModel, setOllamaModel] = useState('llama3.2')
   const [showApiKey, setShowApiKey] = useState(false)
   const [storageLoading, setStorageLoading] = useState(false)
   // C-CHAT: RAG context window — default matches config.ts (10)
@@ -73,6 +74,7 @@ export function Settings() {
     { value: 'base', label: 'Base (~142 MB)', description: 'Good balance of speed and accuracy' },
     { value: 'small', label: 'Small (~466 MB)', description: 'Better accuracy' },
     { value: 'medium', label: 'Medium (~1.5 GB)', description: 'High accuracy' },
+    { value: 'large-v3-turbo', label: 'Large V3 Turbo (~1.6 GB)', description: 'Near best accuracy, much faster, better language detection' },
     { value: 'large-v3', label: 'Large V3 (~3.1 GB)', description: 'Best accuracy, slowest' },
   ]
 
@@ -160,9 +162,10 @@ export function Settings() {
     return (
       chatProvider !== config.chat.provider ||
       ollamaUrl !== config.embeddings.ollamaBaseUrl ||
+      ollamaModel !== (config.chat.ollamaModel || 'llama3.2') ||
       ragContextSize !== config.chat.maxContextChunks
     )
-  }, [config, chatProvider, ollamaUrl, ragContextSize])
+  }, [config, chatProvider, ollamaUrl, ollamaModel, ragContextSize])
 
   // Stable loadConfig with useCallback for dependency array
   const loadConfigStable = useCallback(async () => {
@@ -194,6 +197,7 @@ export function Settings() {
       setWhisperUseGpu(config.transcription.whisperUseGpu || false)
       setChatProvider(config.chat.provider)
       setOllamaUrl(config.embeddings.ollamaBaseUrl)
+      setOllamaModel(config.chat.ollamaModel || 'llama3.2')
       // C-CHAT: Load RAG context window size
       setRagContextSize(config.chat.maxContextChunks)
     }
@@ -377,10 +381,12 @@ export function Settings() {
     // Store previous values for rollback
     const previousChatProvider = config?.chat.provider || 'gemini'
     const previousOllamaUrl = config?.embeddings.ollamaBaseUrl || 'http://localhost:11434'
+    const previousOllamaModel = config?.chat.ollamaModel || 'llama3.2'
     const previousContextSize = config?.chat.maxContextChunks || RAG_DEFAULTS.MAX_CONTEXT_CHUNKS
 
     const chatUpdates = {
       provider: chatProvider,
+      ollamaModel: ollamaModel,
       maxContextChunks: ragContextSize
     }
 
@@ -411,6 +417,7 @@ export function Settings() {
       // Rollback on error - both sections revert
       setChatProvider(previousChatProvider)
       setOllamaUrl(previousOllamaUrl)
+      setOllamaModel(previousOllamaModel)
       setRagContextSize(previousContextSize)
       // Reload config from backend to ensure consistency after partial failure
       try { await loadConfig() } catch { /* best effort reload */ }
@@ -809,24 +816,44 @@ export function Settings() {
               </div>
 
               {chatProvider === 'ollama' && (
-                <div>
-                  <label htmlFor="ollamaUrl" className="text-sm font-medium">Ollama URL</label>
-                  <Input
-                    id="ollamaUrl"
-                    type="url"
-                    placeholder="http://localhost:11434"
-                    value={ollamaUrl}
-                    onChange={(e) => setOllamaUrl(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSaveChat()}
-                    disabled={saving}
-                    aria-label="Ollama base URL"
-                    aria-describedby="ollamaUrl-description"
-                    className="mt-1"
-                  />
-                  <p id="ollamaUrl-description" className="text-xs text-muted-foreground mt-1">
-                    URL of your local Ollama server
-                  </p>
-                </div>
+                <>
+                  <div>
+                    <label htmlFor="ollamaUrl" className="text-sm font-medium">Ollama URL</label>
+                    <Input
+                      id="ollamaUrl"
+                      type="url"
+                      placeholder="http://localhost:11434"
+                      value={ollamaUrl}
+                      onChange={(e) => setOllamaUrl(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleSaveChat()}
+                      disabled={saving}
+                      aria-label="Ollama base URL"
+                      aria-describedby="ollamaUrl-description"
+                      className="mt-1"
+                    />
+                    <p id="ollamaUrl-description" className="text-xs text-muted-foreground mt-1">
+                      URL of your local Ollama server
+                    </p>
+                  </div>
+                  <div>
+                    <label htmlFor="ollamaModel" className="text-sm font-medium">Ollama Model</label>
+                    <Input
+                      id="ollamaModel"
+                      type="text"
+                      placeholder="e.g. llama3.2, qwen2.5:27b, mistral"
+                      value={ollamaModel}
+                      onChange={(e) => setOllamaModel(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleSaveChat()}
+                      disabled={saving}
+                      aria-label="Ollama model name"
+                      aria-describedby="ollamaModel-description"
+                      className="mt-1"
+                    />
+                    <p id="ollamaModel-description" className="text-xs text-muted-foreground mt-1">
+                      Model name as shown in <code className="text-xs">ollama list</code>
+                    </p>
+                  </div>
+                </>
               )}
 
               {/* C-CHAT: RAG Context Window Size */}

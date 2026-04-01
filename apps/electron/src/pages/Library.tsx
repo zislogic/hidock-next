@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { RefreshCw, AlertCircle } from 'lucide-react'
 import { toast } from '@/components/ui/toaster'
+import { getHiDockDeviceService } from '@/services/hidock-device'
 import { useUnifiedRecordings } from '@/hooks/useUnifiedRecordings'
 import {
   UnifiedRecording,
@@ -629,6 +630,20 @@ export function Library() {
     setDeleting(recording.id)
     try {
       await window.electronAPI.recordings.delete(recording.id)
+
+      // Also delete from device if connected and recording has a device filename
+      const deviceFilename = 'deviceFilename' in recording ? (recording as any).deviceFilename : null
+      if (deviceFilename) {
+        try {
+          const deviceService = getHiDockDeviceService()
+          if (deviceService.isConnected()) {
+            await deviceService.deleteFile(deviceFilename)
+          }
+        } catch (deviceErr) {
+          console.warn('Failed to delete from device (local delete succeeded):', deviceErr)
+        }
+      }
+
       await refresh(false)
     } catch (e) {
       console.error('Failed to delete local file:', e)
@@ -1092,8 +1107,8 @@ export function Library() {
               onDownload={() => {
                 if (selectedRecording) handleDownloadCallback(selectedRecording)
               }}
-              onTranscribe={() => {
-                if (selectedRecording) queueTranscription(selectedRecording)
+              onTranscribe={(overrides) => {
+                if (selectedRecording) queueTranscription(selectedRecording, overrides)
               }}
               onDelete={() => {
                 if (selectedRecording) handleDeleteCallback(selectedRecording)

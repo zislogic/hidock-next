@@ -2,6 +2,7 @@ import { ipcMain } from 'electron'
 import { getConfig, saveConfig, updateConfig, AppConfig } from '../services/config'
 import { success, error as errorResult } from '../types/api'
 import { emitActivityLog } from '../services/activity-log'
+import { resetOllamaService } from '../services/ollama'
 
 export function registerConfigHandlers(): void {
   // Get full config
@@ -41,6 +42,11 @@ export function registerConfigHandlers(): void {
     async <K extends keyof AppConfig>(_, section: K, values: Partial<AppConfig[K]>) => {
       try {
         await updateConfig(section, values)
+        // Reset Ollama singleton when chat or embeddings settings change so the
+        // next call to getOllamaService() picks up the new URL / model name.
+        if (section === 'chat' || section === 'embeddings') {
+          resetOllamaService()
+        }
         emitActivityLog('info', `Settings updated: ${String(section)}`)
         return success(getConfig())
       } catch (err) {

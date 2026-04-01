@@ -14,7 +14,8 @@ import { TranscriptViewer } from './TranscriptViewer'
 import { AudioPlayer } from '@/components/AudioPlayer'
 import { UnifiedRecording, hasLocalPath, isDeviceOnly } from '@/types/unified-recording'
 import { Transcript, Meeting, parseJsonArray } from '@/types'
-import { Calendar, Download, Trash2, Wand2, RefreshCw, Play, Square, Pencil, Check, Edit2, Link, X } from 'lucide-react'
+import { Calendar, Download, Trash2, RefreshCw, Play, Square, Pencil, Check, Edit2, Link, X } from 'lucide-react'
+import { TranscriptionControls } from './TranscriptionControls'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -45,7 +46,7 @@ interface SourceReaderProps {
   onSeek?: (startMs: number, endMs?: number) => void
   // Action button callbacks
   onDownload?: () => void
-  onTranscribe?: () => void
+  onTranscribe?: (overrides?: { provider?: string; model?: string; language?: string }) => void
   onDelete?: () => void
   // State for button enabling/disabling
   deviceConnected?: boolean
@@ -103,7 +104,7 @@ export function SourceReader({
   }, [recording?.id])
 
   const handleSaveTitle = useCallback(async () => {
-    if (!recording?.knowledgeCaptureId) return
+    if (!recording) return
     const trimmed = editedTitle.trim()
     if (!trimmed) {
       setEditedTitle(recording.title || recording.filename)
@@ -116,11 +117,23 @@ export function SourceReader({
     }
     setIsSavingTitle(true)
     try {
-      const result = await window.electronAPI.knowledge.update(
-        recording.knowledgeCaptureId,
-        { title: trimmed }
-      )
-      if (result.success) {
+      let success = false
+      if (recording.knowledgeCaptureId) {
+        // Update via knowledge capture if one exists
+        const result = await window.electronAPI.knowledge.update(
+          recording.knowledgeCaptureId,
+          { title: trimmed }
+        )
+        success = result.success
+      } else {
+        // Update display_name on the recording directly
+        const result = await window.electronAPI.recordings.updateDisplayName(
+          recording.id,
+          trimmed
+        )
+        success = result.success
+      }
+      if (success) {
         setIsEditingTitle(false)
         setMetadataEdited(true)
         toast.success('Title updated')
@@ -239,19 +252,17 @@ export function SourceReader({
                 <h2 className="text-xl font-semibold truncate" title={recording.filename}>
                   {recording.title || recording.filename}
                 </h2>
-                {recording.knowledgeCaptureId && (
-                  <button
-                    onClick={() => {
-                      setIsEditingTitle(true)
-                      setEditedTitle(recording.title || recording.filename)
-                    }}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-muted"
-                    aria-label="Edit title"
-                    title="Edit title"
-                  >
-                    <Pencil className="h-4 w-4 text-muted-foreground" />
-                  </button>
-                )}
+                <button
+                  onClick={() => {
+                    setIsEditingTitle(true)
+                    setEditedTitle(recording.title || recording.filename)
+                  }}
+                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-muted"
+                  aria-label="Edit title"
+                  title="Edit title"
+                >
+                  <Pencil className="h-4 w-4 text-muted-foreground" />
+                </button>
               </div>
             )}
           </div>
@@ -437,37 +448,13 @@ export function SourceReader({
           </Button>
         )}
 
-        {/* Transcribe Button - only for local recordings without transcript */}
-        {hasLocalPath(recording) && recording.transcriptionStatus !== 'complete' && onTranscribe && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleTranscribeClick}
-            disabled={recording.transcriptionStatus === 'pending' || recording.transcriptionStatus === 'processing'}
-            className="gap-2"
-            title={
-              recording.transcriptionStatus === 'pending' ? "Transcription queued" :
-              recording.transcriptionStatus === 'processing' ? "Transcription in progress" :
-              "Start AI transcription"
-            }
-          >
-            {recording.transcriptionStatus === 'processing' ? (
-              <>
-                <RefreshCw className="h-4 w-4 animate-spin" />
-                In Progress
-              </>
-            ) : recording.transcriptionStatus === 'pending' ? (
-              <>
-                <RefreshCw className="h-4 w-4" />
-                Queued
-              </>
-            ) : (
-              <>
-                <Wand2 className="h-4 w-4" />
-                Transcribe
-              </>
-            )}
-          </Button>
+        {/* Transcription Controls - language + model selector with (re-)transcribe */}
+        {hasLocalPath(recording) && onTranscribe && (
+          <TranscriptionControls
+            recording={recording}
+            hasTranscript={recording.transcriptionStatus === 'complete'}
+            onTranscribe={(overrides) => onTranscribe(overrides)}
+          />
         )}
 
         {/* Delete Button - always available */}

@@ -1,9 +1,9 @@
 import { memo } from 'react'
-import { Play, X, AlertCircle, Download, Trash2, Wand2, Mic, FileText, RefreshCw } from 'lucide-react'
+import { Play, X, AlertCircle, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { formatDate, formatDuration } from '@/lib/utils'
+import { formatDateTime, formatDuration } from '@/lib/utils'
 import { Meeting, Transcript } from '@/types'
 import { UnifiedRecording, hasLocalPath } from '@/types/unified-recording'
 import { StatusIcon } from './StatusIcon'
@@ -61,8 +61,7 @@ export const SourceRow = memo(function SourceRow({
   const error = useLibraryStore((state) => state.recordingErrors.get(recording.id))
 
   // Smart title
-  const { primaryText, source: titleSource } = getDisplayTitle(recording, meeting, transcript)
-  const showFilenameInSecondary = titleSource !== 'filename'
+  const { primaryText } = getDisplayTitle(recording, meeting, transcript)
 
   const handleCheckboxClick = (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -78,14 +77,11 @@ export const SourceRow = memo(function SourceRow({
     onClick?.()
   }
 
-  // Build secondary line: date + duration + filename (when title isn't filename)
+  // Build secondary line: date+time + duration
   const secondaryParts: string[] = []
-  secondaryParts.push(formatDate(recording.dateRecorded))
+  secondaryParts.push(formatDateTime(recording.dateRecorded))
   if (recording.duration) {
     secondaryParts.push(formatDuration(recording.duration))
-  }
-  if (showFilenameInSecondary) {
-    secondaryParts.push(recording.filename)
   }
   const secondaryText = secondaryParts.join(' \u00B7 ')
 
@@ -139,71 +135,6 @@ export const SourceRow = memo(function SourceRow({
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>
-        )}
-
-        {/* Ask Assistant button */}
-        {onAskAssistant && (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(e) => { e.stopPropagation(); onAskAssistant(); }}
-            title="Ask Assistant about this capture"
-          >
-            <Mic className="h-3.5 w-3.5" />
-          </Button>
-        )}
-
-        {/* Generate Output button */}
-        {onGenerateOutput && (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(e) => { e.stopPropagation(); onGenerateOutput(); }}
-            title="Generate artifact from this capture"
-          >
-            <FileText className="h-3.5 w-3.5" />
-          </Button>
-        )}
-
-        {/* Transcribe button - only for local recordings without complete transcript */}
-        {hasLocalPath(recording) && recording.transcriptionStatus !== 'complete' && onTranscribe && (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(e) => { e.stopPropagation(); onTranscribe(); }}
-            disabled={recording.transcriptionStatus === 'pending' || recording.transcriptionStatus === 'processing'}
-            title={
-              recording.transcriptionStatus === 'pending' ? 'Transcription queued' :
-              recording.transcriptionStatus === 'processing' ? 'Transcription in progress' :
-              'Transcribe this capture'
-            }
-          >
-            {recording.transcriptionStatus === 'processing' ? (
-              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Wand2 className="h-3.5 w-3.5" />
-            )}
-          </Button>
-        )}
-
-        {/* Download button - only for device-only recordings */}
-        {recording.location === 'device-only' && onDownload && (
-          isDownloading ? (
-            <div className="flex items-center gap-1 text-xs text-muted-foreground px-2">
-              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-              <span>{downloadProgress ?? 0}%</span>
-            </div>
-          ) : (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={(e) => { e.stopPropagation(); onDownload(); }}
-              disabled={!deviceConnected}
-              title={deviceConnected ? 'Download to computer' : 'Device not connected'}
-            >
-              <Download className="h-3.5 w-3.5" />
-            </Button>
-          )
         )}
 
         {/* Play/Stop button */}

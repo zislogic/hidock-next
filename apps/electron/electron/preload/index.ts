@@ -152,7 +152,7 @@ export interface ElectronAPI {
     addExternalByPath: (filePath: string) => Promise<{ success: boolean; recording?: any; error?: string }>
     // Transcription
     transcribe: (recordingId: string) => Promise<void>
-    addToQueue: (recordingId: string) => Promise<string | false>
+    addToQueue: (recordingId: string, overrides?: { provider?: string; model?: string; language?: string }) => Promise<string | false>
     processQueue: () => Promise<boolean>
     getTranscriptionStatus: () => Promise<{ isProcessing: boolean; pendingCount: number; processingCount: number }>
     getTranscriptionQueue: () => Promise<any[]>
@@ -521,10 +521,12 @@ const electronAPI: ElectronAPI = {
     updateStatus: (id, status) => callIPC('db:update-recording-status', id, status),
     updateRecordingStatus: (id, status) => callIPC('recordings:updateStatus', id, status),
     updateTranscriptionStatus: (id, status) => callIPC('recordings:updateTranscriptionStatus', id, status),
+    updateDisplayName: (id: string, displayName: string | null) => callIPC('recordings:updateDisplayName', id, displayName),
     linkToMeeting: (recordingId, meetingId, confidence, method) =>
       callIPC('db:link-recording-to-meeting', recordingId, meetingId, confidence, method),
     delete: (id) => callIPC('recordings:delete', id),
     deleteBatch: (ids) => callIPC('recordings:deleteBatch', ids),
+    getDeletedFilenames: () => callIPC('recordings:getDeletedFilenames'),
     // Recording-Meeting linking dialog methods
     getCandidates: (recordingId) => callIPC('recordings:getCandidates', recordingId),
     getMeetingsNearDate: (date) => callIPC('recordings:getMeetingsNearDate', date),
@@ -534,7 +536,7 @@ const electronAPI: ElectronAPI = {
     addExternalByPath: (filePath: string) => callIPC('recordings:addExternalByPath', filePath),
     // Transcription
     transcribe: (recordingId) => callIPC('recordings:transcribe', recordingId),
-    addToQueue: (recordingId) => callIPC('recordings:addToQueue', recordingId),
+    addToQueue: (recordingId, overrides) => callIPC('recordings:addToQueue', recordingId, overrides),
     processQueue: () => callIPC('recordings:processQueue'),
     getTranscriptionStatus: () => callIPC('recordings:getTranscriptionStatus'),
     getTranscriptionQueue: () => callIPC('transcription:getQueue'),

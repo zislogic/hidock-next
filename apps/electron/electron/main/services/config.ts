@@ -39,7 +39,7 @@ export interface AppConfig {
     geminiModel: string
     autoTranscribe: boolean
     language: string
-    whisperModelSize: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3'
+    whisperModelSize: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3-turbo' | 'large-v3'
     whisperLanguage: string
     whisperUseGpu: boolean
   }
@@ -88,9 +88,9 @@ const DEFAULT_CONFIG: AppConfig = {
     geminiModel: 'gemini-3-pro-preview', // Best model for audio transcription
     autoTranscribe: true,
     language: 'es',
-    whisperModelSize: 'base',
+    whisperModelSize: 'large-v3',
     whisperLanguage: 'auto',
-    whisperUseGpu: false
+    whisperUseGpu: true
   },
   embeddings: {
     provider: 'ollama',

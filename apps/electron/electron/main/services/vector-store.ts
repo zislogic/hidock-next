@@ -189,14 +189,19 @@ class VectorStore {
       subject?: string
     }
   ): Promise<number> {
-    // Check if already indexed
+    // Remove old chunks if re-transcribing
     if (metadata.recordingId) {
-      const existing = Array.from(this.documents.values()).filter(
-        (d) => d.metadata.recordingId === metadata.recordingId
+      const existing = Array.from(this.documents.entries()).filter(
+        ([, d]) => d.metadata.recordingId === metadata.recordingId
       )
       if (existing.length > 0) {
-        console.log(`Transcript ${metadata.recordingId} already indexed`)
-        return 0
+        console.log(`Removing ${existing.length} old chunks for ${metadata.recordingId} before re-indexing`)
+        for (const [id] of existing) {
+          this.documents.delete(id)
+        }
+        // Also remove from database
+        const db = getDatabase()
+        db.run('DELETE FROM vector_embeddings WHERE recording_id = ?', [metadata.recordingId])
       }
     }
 

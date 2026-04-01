@@ -79,9 +79,11 @@ const electronAPI = {
     updateStatus: (id, status) => callIPC("db:update-recording-status", id, status),
     updateRecordingStatus: (id, status) => callIPC("recordings:updateStatus", id, status),
     updateTranscriptionStatus: (id, status) => callIPC("recordings:updateTranscriptionStatus", id, status),
+    updateDisplayName: (id, displayName) => callIPC("recordings:updateDisplayName", id, displayName),
     linkToMeeting: (recordingId, meetingId, confidence, method) => callIPC("db:link-recording-to-meeting", recordingId, meetingId, confidence, method),
     delete: (id) => callIPC("recordings:delete", id),
     deleteBatch: (ids) => callIPC("recordings:deleteBatch", ids),
+    getDeletedFilenames: () => callIPC("recordings:getDeletedFilenames"),
     // Recording-Meeting linking dialog methods
     getCandidates: (recordingId) => callIPC("recordings:getCandidates", recordingId),
     getMeetingsNearDate: (date) => callIPC("recordings:getMeetingsNearDate", date),
@@ -91,7 +93,7 @@ const electronAPI = {
     addExternalByPath: (filePath) => callIPC("recordings:addExternalByPath", filePath),
     // Transcription
     transcribe: (recordingId) => callIPC("recordings:transcribe", recordingId),
-    addToQueue: (recordingId) => callIPC("recordings:addToQueue", recordingId),
+    addToQueue: (recordingId, overrides) => callIPC("recordings:addToQueue", recordingId, overrides),
     processQueue: () => callIPC("recordings:processQueue"),
     getTranscriptionStatus: () => callIPC("recordings:getTranscriptionStatus"),
     getTranscriptionQueue: () => callIPC("transcription:getQueue"),
@@ -262,6 +264,21 @@ const electronAPI = {
         electron.ipcRenderer.removeListener("integrity:progress", handler);
       };
     }
+  },
+  // Whisper Model Management
+  whisper: {
+    getDownloadedModels: () => callIPC("whisper:getDownloadedModels"),
+    getModelStatus: (modelSize) => callIPC("whisper:getModelStatus", modelSize),
+    downloadModel: (modelSize) => callIPC("whisper:downloadModel", modelSize),
+    cancelDownload: () => callIPC("whisper:cancelDownload"),
+    deleteModel: (modelSize) => callIPC("whisper:deleteModel", modelSize)
+  },
+  onWhisperDownloadProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    electron.ipcRenderer.on("whisper:download-progress", handler);
+    return () => {
+      electron.ipcRenderer.removeListener("whisper:download-progress", handler);
+    };
   },
   // Domain Event Listener
   onDomainEvent: (callback) => {

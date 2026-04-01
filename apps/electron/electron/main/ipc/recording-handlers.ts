@@ -5,11 +5,13 @@ import {
   getRecordingsForMeeting,
   updateRecordingStatus,
   updateRecordingTranscriptionStatus,
+  updateRecordingDisplayName,
   linkRecordingToMeeting,
   getTranscriptByRecordingId,
   getCandidatesForRecordingWithDetails,
   getMeetingsNearDate,
   insertRecording,
+  getDeletedRecordingFilenames,
   type Recording,
   type Transcript
 } from '../services/database'
@@ -55,6 +57,16 @@ export function registerRecordingHandlers(): void {
       return getRecordings()
     } catch (error) {
       console.error('recordings:getAll error:', error)
+      return []
+    }
+  })
+
+  // Get filenames of deleted recordings (to filter cached device files)
+  ipcMain.handle('recordings:getDeletedFilenames', async (): Promise<string[]> => {
+    try {
+      return getDeletedRecordingFilenames()
+    } catch (error) {
+      console.error('recordings:getDeletedFilenames error:', error)
       return []
     }
   })
@@ -122,14 +134,23 @@ export function registerRecordingHandlers(): void {
       }
 
       const recording = getRecordingById(result.data.id)
-      if (recording && recording.file_path) {
-        const deleted = deleteRecordingFile(recording.file_path)
-        if (deleted) {
-          updateRecordingStatus(result.data.id, 'deleted')
-        }
-        return deleted
+      if (!recording) {
+        console.log('recordings:delete: recording not found:', result.data.id)
+        return false
       }
-      return false
+
+      // Delete the local file if it exists
+      if (recording.file_path) {
+        try {
+          deleteRecordingFile(recording.file_path)
+        } catch (e) {
+          console.warn('recordings:delete: failed to delete file:', e)
+        }
+      }
+
+      // Remove from database regardless of file deletion
+      updateRecordingStatus(result.data.id, 'deleted')
+      return true
     } catch (error) {
       console.error('recordings:delete error:', error)
       return false
@@ -535,36 +556,43 @@ export function registerRecordingHandlers(): void {
   })
 
   // Add a recording to the transcription queue
-  ipcMain.handle('recordings:addToQueue', async (_, recordingId: string) => {
-    try {
-      // Validate provider requirements before queueing
-      const config = getConfig()
-      if (config.transcription.provider === 'gemini' && !config.transcription.geminiApiKey) {
-        return {
-          success: false,
-          error: 'Transcription API key not configured. Please add your API key in Settings.'
-        }
-      }
-      if (config.transcription.provider === 'whisper') {
-        const { isModelDownloaded } = await import('../services/whisper-models')
-        if (!isModelDownloaded(config.transcription.whisperModelSize)) {
+  ipcMain.handle(
+    'recordings:addToQueue',
+    async (_, recordingId: string, overrides?: { provider?: string; model?: string; language?: string }) => {
+      try {
+        // Determine effective provider from override or global config
+        const config = getConfig()
+        const effectiveProvider = overrides?.provider || config.transcription.provider
+
+        // Validate provider requirements before queueing
+        if (effectiveProvider === 'gemini' && !config.transcription.geminiApiKey) {
           return {
             success: false,
-            error: `Whisper model "${config.transcription.whisperModelSize}" not downloaded. Please download it in Settings.`
+            error: 'Transcription API key not configured. Please add your API key in Settings.'
           }
         }
-      }
+        if (effectiveProvider === 'whisper') {
+          const { isModelDownloaded } = await import('../services/whisper-models')
+          const effectiveModel = overrides?.model || config.transcription.whisperModelSize
+          if (!isModelDownloaded(effectiveModel as any)) {
+            return {
+              success: false,
+              error: `Whisper model "${effectiveModel}" not downloaded. Please download it in Settings.`
+            }
+          }
+        }
 
-      const queueItemId = addToQueue(recordingId)
-      updateRecordingTranscriptionStatus(recordingId, 'queued')
-      // spec-005: Trigger immediate queue processing after adding
-      processQueueManually()
-      return queueItemId
-    } catch (error) {
-      console.error('recordings:addToQueue error:', error)
-      return false
+        const queueItemId = addToQueue(recordingId, overrides)
+        updateRecordingTranscriptionStatus(recordingId, 'queued')
+        // spec-005: Trigger immediate queue processing after adding
+        processQueueManually()
+        return queueItemId
+      } catch (error) {
+        console.error('recordings:addToQueue error:', error)
+        return false
+      }
     }
-  })
+  )
 
   // Start processing the transcription queue
   ipcMain.handle('recordings:processQueue', async () => {
@@ -633,6 +661,20 @@ export function registerRecordingHandlers(): void {
     } catch (error) {
       console.error('recordings:updateTranscriptionStatus error:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error occurred' }
+    }
+  })
+
+  // Update display name
+  ipcMain.handle('recordings:updateDisplayName', async (_, id: string, displayName: string | null): Promise<{ success: boolean; error?: string }> => {
+    try {
+      if (!id || typeof id !== 'string') {
+        return { success: false, error: 'Invalid recording ID' }
+      }
+      updateRecordingDisplayName(id, displayName)
+      return { success: true }
+    } catch (error) {
+      console.error('recordings:updateDisplayName error:', error)
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
     }
   })
 

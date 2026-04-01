@@ -27,7 +27,7 @@ export const AssessmentMethodSchema = z.enum(['manual', 'auto', 'ai'])
  * Set quality assessment request
  */
 export const SetQualitySchema = z.object({
-  recordingId: z.string().uuid('Recording ID must be a valid UUID'),
+  recordingId: z.string().min(1),
   quality: QualityLevelSchema,
   reason: z.string().max(1000).optional(),
   assessedBy: z.string().max(200).optional()
@@ -44,7 +44,7 @@ export const GetByQualitySchema = z.object({
  * Batch auto-assess request
  */
 export const BatchAutoAssessSchema = z.object({
-  recordingIds: z.array(z.string().uuid()).min(1).max(1000)
+  recordingIds: z.array(z.string().min(1)).min(1).max(1000)
 })
 
 // =============================================================================
@@ -90,7 +90,7 @@ export const GetCleanupSuggestionsForTierSchema = z.object({
  * Execute cleanup request
  */
 export const ExecuteCleanupSchema = z.object({
-  recordingIds: z.array(z.string().uuid()).min(1).max(1000),
+  recordingIds: z.array(z.string().min(1)).min(1).max(1000),
   archive: z.boolean().default(false)
 })
 
@@ -98,7 +98,7 @@ export const ExecuteCleanupSchema = z.object({
  * Assign tier request
  */
 export const AssignTierSchema = z.object({
-  recordingId: z.string().uuid(),
+  recordingId: z.string().min(1),
   quality: QualityLevelSchema
 })
 
@@ -109,7 +109,7 @@ export const AssignTierSchema = z.object({
 /**
  * Recording ID validation
  */
-export const RecordingIdSchema = z.string().uuid('Recording ID must be a valid UUID')
+export const RecordingIdSchema = z.string().min(1, 'Recording ID must not be empty').max(500)
 
 /**
  * Get recording by ID request
@@ -129,7 +129,7 @@ export const DeleteRecordingSchema = z.object({
  * Batch delete recordings request (B-LIB-007)
  */
 export const DeleteBatchRecordingsSchema = z.object({
-  ids: z.array(z.string().uuid('Each ID must be a valid UUID')).min(1).max(1000)
+  ids: z.array(z.string().min(1)).min(1).max(1000)
 })
 
 /**
@@ -137,7 +137,7 @@ export const DeleteBatchRecordingsSchema = z.object({
  */
 export const LinkRecordingToMeetingSchema = z.object({
   recordingId: RecordingIdSchema,
-  meetingId: z.string().uuid('Meeting ID must be a valid UUID')
+  meetingId: z.string().min(1)
 })
 
 /**
@@ -302,7 +302,7 @@ export function validateRecordingId(id: unknown): string {
  * @deprecated Use BatchAutoAssessSchema.safeParse() instead
  */
 export function validateRecordingIds(ids: unknown): string[] {
-  const result = z.array(z.string().uuid()).min(1).max(1000).safeParse(ids)
+  const result = z.array(z.string().min(1)).min(1).max(1000).safeParse(ids)
   if (!result.success) {
     throw new ValidationError(result.error.issues[0]?.message || 'Invalid recording IDs array')
   }

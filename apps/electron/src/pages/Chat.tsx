@@ -162,11 +162,28 @@ export function Chat() {
     setContextLoading(true)
     setContextError(null)
     try {
-      // Validate knowledge capture exists
-      const capture = await window.electronAPI.knowledge.getById(contextId)
+      // Try as knowledge capture first, then fall back to recording lookup
+      let capture = await window.electronAPI.knowledge.getById(contextId)
       if (!capture) {
-        setContextError('Recording not found')
-        return
+        // Fall back: look up by source recording ID
+        const allCaptures = await window.electronAPI.knowledge.getAll() as any[]
+        capture = allCaptures?.find((kc: any) => kc.sourceRecordingId === contextId) || null
+      }
+      if (!capture) {
+        // Still not found — create a minimal context from the recording itself
+        const recordings = await window.electronAPI.recordings.getAll() as any[]
+        const recording = recordings?.find((r: any) => r.id === contextId)
+        if (!recording) {
+          setContextError('Recording not found')
+          return
+        }
+        capture = {
+          id: recording.id,
+          title: recording.filename,
+          sourceRecordingId: recording.id,
+          status: 'ready',
+          capturedAt: recording.date_recorded || new Date().toISOString()
+        } as any
       }
       setContextRecording(capture)
 

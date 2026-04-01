@@ -136,7 +136,8 @@ function buildRecordingMap(
   syncedFiles: SyncedFile[],
   cachedDeviceFiles: CachedDeviceFile[],
   isConnected: boolean,
-  knowledgeCaptures: KnowledgeCapture[] = []
+  knowledgeCaptures: KnowledgeCapture[] = [],
+  deletedBaseNames: Set<string> = new Set()
 ): UnifiedRecording[] {
   // Create lookup maps using BASE filename (without extension)
   // This allows matching .hda (device) with .wav (downloaded) files
@@ -171,6 +172,9 @@ function buildRecordingMap(
   // Process device recordings first
   for (const deviceRec of deviceRecs) {
     const baseName = getBaseFilename(deviceRec.filename)
+
+    // Skip recordings that were deleted by the user
+    if (deletedBaseNames.has(baseName)) continue
 
     // Look up by base filename to match .hda with .wav
     let synced = syncedMapByOriginal.get(deviceRec.filename) || syncedMapByBase.get(baseName)
@@ -207,7 +211,7 @@ function buildRecordingMap(
         localPath: synced?.file_path || dbRec?.file_path || '',
         syncStatus: 'synced',
         knowledgeCaptureId: capture?.id,
-        title: capture?.title,
+        title: capture?.title || (dbRec as any)?.display_name,
         quality: capture?.quality,
         category: capture?.category ?? undefined,
         status: capture?.status ?? undefined,
@@ -255,14 +259,14 @@ function buildRecordingMap(
         size: dbRec.file_size,
         duration: dbRec.duration_seconds || 0,
         dateRecorded,
-        transcriptionStatus: mapTranscriptionStatus(dbRec.status, capture?.status ?? undefined),
+        transcriptionStatus: mapTranscriptionStatus(dbRec.transcription_status ?? dbRec.status, capture?.status ?? undefined),
         meetingId: dbRec.meeting_id,
         location: 'local-only',
         localPath: dbRec.file_path,
         syncStatus: 'synced',
         isImported: !synced,
         knowledgeCaptureId: capture?.id,
-        title: capture?.title,
+        title: capture?.title || (dbRec as any)?.display_name,
         quality: capture?.quality,
         category: capture?.category ?? undefined,
         status: capture?.status ?? undefined,
@@ -281,7 +285,7 @@ function buildRecordingMap(
   if (shouldUseCachedFiles) {
     for (const cached of cachedDeviceFiles) {
       const baseName = getBaseFilename(cached.filename)
-      if (!processedBaseNames.has(baseName)) {
+      if (!processedBaseNames.has(baseName) && !deletedBaseNames.has(baseName)) {
         const cachedDate = new Date(cached.date_recorded)
         const dateRecorded = getBestDate(cached.filename, cachedDate, cachedDate)
         const recording: DeviceOnlyRecording = {
@@ -416,12 +420,14 @@ export function useUnifiedRecordings(): UseUnifiedRecordingsResult {
       console.log('[useUnifiedRecordings] Device connected:', isConnected)
 
       // PHASE 1: Load local data + cache FIRST (fast) for instant display
-      const [dbRecs, syncedFiles, cachedDeviceFiles, knowledgeCaptures] = await Promise.all([
+      const [dbRecs, syncedFiles, cachedDeviceFiles, knowledgeCaptures, deletedFilenames] = await Promise.all([
         window.electronAPI.recordings.getAll() as Promise<DatabaseRecording[]>,
         window.electronAPI.syncedFiles.getAll() as Promise<SyncedFile[]>,
         window.electronAPI.deviceCache.getAll() as Promise<CachedDeviceFile[]>,
-        window.electronAPI.knowledge.getAll() as Promise<KnowledgeCapture[]>
+        window.electronAPI.knowledge.getAll() as Promise<KnowledgeCapture[]>,
+        window.electronAPI.recordings.getDeletedFilenames() as Promise<string[]>
       ])
+      const deletedSet = new Set(deletedFilenames.map(f => getBaseFilename(f)))
       console.log('[useUnifiedRecordings] Loaded: dbRecs:', dbRecs.length, 'syncedFiles:', syncedFiles.length, 'cachedDeviceFiles:', cachedDeviceFiles.length, 'knowledgeCaptures:', knowledgeCaptures?.length)
 
       // Debug: Show sample synced files to verify original_filename is present
@@ -440,7 +446,7 @@ export function useUnifiedRecordings(): UseUnifiedRecordingsResult {
       // Show cached/local data immediately and mark as loaded
       // If we have in-memory cache from device service, use that for immediate display
       // This fixes the issue where navigating to Library shows stale data
-      const initialRecordings = buildRecordingMap(memoryCachedDeviceRecs, dbRecs, syncedFiles, cachedDeviceFiles, isConnected, knowledgeCaptures)
+      const initialRecordings = buildRecordingMap(memoryCachedDeviceRecs, dbRecs, syncedFiles, cachedDeviceFiles, isConnected, knowledgeCaptures, deletedSet)
       console.log('[useUnifiedRecordings] Built', initialRecordings.length, 'recordings')
 
       // Debug: Show sample dates
@@ -495,7 +501,7 @@ export function useUnifiedRecordings(): UseUnifiedRecordingsResult {
       }
 
       // PHASE 3: Build final recording list with all data (silent update)
-      const finalRecordings = buildRecordingMap(deviceRecs, dbRecs, syncedFiles, cachedDeviceFiles, isConnected, knowledgeCaptures)
+      const finalRecordings = buildRecordingMap(deviceRecs, dbRecs, syncedFiles, cachedDeviceFiles, isConnected, knowledgeCaptures, deletedSet)
       console.log('[useUnifiedRecordings] Final recordings count:', finalRecordings.length)
       setRecordings(finalRecordings)
       // Decrement loading after final update (covers Phase 2 path only — Phase 1-only already decremented)

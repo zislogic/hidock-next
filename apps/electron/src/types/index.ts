@@ -165,7 +165,7 @@ export interface AppConfig {
     geminiModel: string
     autoTranscribe: boolean
     language: string
-    whisperModelSize: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3'
+    whisperModelSize: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3-turbo' | 'large-v3'
     whisperLanguage: string
     whisperUseGpu: boolean
   }

@@ -282,6 +282,9 @@ CREATE TABLE IF NOT EXISTS transcription_queue (
     retry_count INTEGER DEFAULT 0,
     progress INTEGER DEFAULT 0,
     error_message TEXT,
+    override_provider TEXT,
+    override_model TEXT,
+    override_language TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     started_at TEXT,
     completed_at TEXT,
@@ -1255,6 +1258,7 @@ export async function initializeDatabase(): Promise<void> {
     const recordingsInfo = database.exec("PRAGMA table_info(recordings)")
     const recCols = recordingsInfo[0].values.map(col => col[1])
     const recordingRepairs = [
+      { name: 'display_name', def: "TEXT" },
       { name: 'migrated_to_capture_id', def: "TEXT" },
       { name: 'migration_status', def: "TEXT CHECK(migration_status IN ('pending', 'migrated', 'skipped', 'error')) DEFAULT 'pending'" },
       { name: 'migrated_at', def: "TEXT" }
@@ -1296,7 +1300,10 @@ export async function initializeDatabase(): Promise<void> {
       const queueCols = queueInfo[0].values.map(col => col[1])
       const queueRepairs = [
         { name: 'retry_count', def: 'INTEGER DEFAULT 0' },
-        { name: 'progress', def: 'INTEGER DEFAULT 0' }
+        { name: 'progress', def: 'INTEGER DEFAULT 0' },
+        { name: 'override_provider', def: 'TEXT' },
+        { name: 'override_model', def: 'TEXT' },
+        { name: 'override_language', def: 'TEXT' }
       ]
       for (const col of queueRepairs) {
         if (!queueCols.includes(col.name)) {
@@ -1460,7 +1467,11 @@ export function runInTransaction<T>(fn: () => T): T {
     saveDatabase()
     return result
   } catch (error) {
-    database.run('ROLLBACK')
+    try {
+      database.run('ROLLBACK')
+    } catch {
+      // Transaction may have been auto-rolled-back by SQLite on constraint violations
+    }
     throw error
   }
 }
@@ -1760,6 +1771,7 @@ export interface Recording {
   id: string
   filename: string
   original_filename?: string
+  display_name?: string  // User-editable display name, defaults to filename
   file_path: string | null  // NULL if not stored locally
   file_size?: number
   duration_seconds?: number
@@ -1785,7 +1797,7 @@ export interface Recording {
 }
 
 export function getRecordings(): Recording[] {
-  return queryAll<Recording>('SELECT * FROM recordings ORDER BY date_recorded DESC')
+  return queryAll<Recording>("SELECT * FROM recordings WHERE status != 'deleted' ORDER BY date_recorded DESC")
 }
 
 export function getRecordingById(id: string): Recording | undefined {
@@ -1813,6 +1825,11 @@ export function getRecordingsByIds(ids: string[]): Map<string, Recording> {
 // Get recording by filename (canonical identifier)
 export function getRecordingByFilename(filename: string): Recording | undefined {
   return queryOne<Recording>('SELECT * FROM recordings WHERE filename = ?', [filename])
+}
+
+// Update recording display name
+export function updateRecordingDisplayName(id: string, displayName: string | null): void {
+  run('UPDATE recordings SET display_name = ? WHERE id = ?', [displayName, id])
 }
 
 // Update recording lifecycle state
@@ -1961,6 +1978,11 @@ export function insertRecording(recording: Omit<Recording, 'created_at'>): void 
 
 export function updateRecordingStatus(id: string, status: string): void {
   run('UPDATE recordings SET status = ? WHERE id = ?', [status, id])
+}
+
+export function getDeletedRecordingFilenames(): string[] {
+  return queryAll<{ filename: string }>("SELECT filename FROM recordings WHERE status = 'deleted'")
+    .map(r => r.filename)
 }
 
 export function updateRecordingTranscriptionStatus(id: string, transcriptionStatus: string): void {
@@ -2115,6 +2137,12 @@ export function getAllEmbeddings(): Embedding[] {
 }
 
 // Queue queries
+export interface TranscriptionOverrides {
+  provider?: string
+  model?: string
+  language?: string
+}
+
 export interface QueueItem {
   id: string
   recording_id: string
@@ -2123,14 +2151,20 @@ export interface QueueItem {
   retry_count: number
   progress: number
   error_message?: string
+  override_provider?: string
+  override_model?: string
+  override_language?: string
   created_at: string
   started_at?: string
   completed_at?: string
 }
 
-export function addToQueue(recordingId: string): string {
+export function addToQueue(recordingId: string, overrides?: TranscriptionOverrides): string {
   const id = crypto.randomUUID()
-  run('INSERT INTO transcription_queue (id, recording_id) VALUES (?, ?)', [id, recordingId])
+  run(
+    'INSERT INTO transcription_queue (id, recording_id, override_provider, override_model, override_language) VALUES (?, ?, ?, ?, ?)',
+    [id, recordingId, overrides?.provider ?? null, overrides?.model ?? null, overrides?.language ?? null]
+  )
   return id
 }
 
