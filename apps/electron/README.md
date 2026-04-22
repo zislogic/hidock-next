@@ -2,6 +2,41 @@
 
 **The fourth iteration and PRIMARY APPLICATION of HiDock Next** - A cross-platform Electron application that transforms ANY information source into actionable insights. Not just audio recordings - this is a universal knowledge extraction and management system.
 
+## Fork Changes (zislogic/hidock-next)
+
+This fork adds full **local/offline AI processing** support to the Electron app — transcription, analysis, and output generation all run without any cloud API dependency.
+
+### Local Whisper Transcription
+- Integrated **whisper.cpp** via `@fugood/whisper.node` for on-device speech-to-text
+- Supports models: `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3` (default)
+- Automatic model download with progress tracking in Settings
+- Language selection per-recording and as a global default
+- Re-transcribe button with model and language override
+- **Silero VAD** (Voice Activity Detection) pre-filters silence before transcription, preventing Whisper hallucinations on quiet segments
+
+### Fully Local AI Pipeline
+- **Transcription**: Whisper (local) or Gemini (cloud) — switchable in Settings
+- **Analysis** (summaries, action items, topics): Ollama when configured, falls back to Gemini
+- **Chat / RAG**: Ollama local LLM with configurable model name
+- **Meeting Minutes generation**: Ollama with `think: false` for compatibility with reasoning models (qwen3, DeepSeek R1, etc.)
+- Ollama model name is now configurable in Settings → Chat/RAG (e.g. `qwen3.5:27b`, `llama3.2`, `mistral`)
+
+### UX Improvements
+- **Library list view** simplified: only Play and Delete buttons visible; secondary text shows date/time and duration instead of filename
+- **Recording duration** fixed: removed incorrect 4× correction factor from all firmware version calculations
+- **Generate Meeting Minutes** opens an inline modal directly in the Library — no page navigation required
+- **Rename recordings** via the detail panel
+- **Delete also removes from device** when a HiDock device is connected
+- Deleted recordings no longer reappear from the device cache after deletion
+
+### Bug Fixes
+- Transcription transcript saved even when Gemini analysis fails (rate limit / no API key)
+- Ollama singleton resets when Settings are saved, so model/URL changes take effect immediately without restarting
+- Thinking-mode models (`qwen3`, `deepseek-r1`) no longer hang or return empty output — `think: false` disables reasoning mode for generation calls
+- Non-UUID recording IDs handled correctly in delete flow
+
+---
+
 ## Vision: Universal Knowledge Hub
 
 This is the **integrated vision** that unifies all previous HiDock Next iterations (Desktop device management, Web transcription, Audio Insights analysis) into a single, powerful intelligence system. The goal is to extract data, create insights, and produce results from ANY knowledge source - not just recordings, but PDFs, presentations, documents, markdown files, notes, calendar events, emails, Slack messages, and more.
@@ -193,8 +228,12 @@ App data is stored in `~/HiDock/`:
 | Calendar ICS URL | URL to your calendar ICS feed |
 | Auto-sync | Enable automatic calendar refresh |
 | Gemini API Key | Google Gemini API key for transcription |
+| Transcription Provider | Gemini (cloud) or Whisper (local) |
+| Whisper Model | Model size for local transcription (large-v3 recommended) |
+| Whisper Language | Default transcription language (auto-detect or specific) |
 | Ollama URL | Local Ollama server URL (default: http://localhost:11434) |
-| Chat Provider | Choose between Ollama or Gemini for chat |
+| Ollama Model | Model name as shown in `ollama list` (e.g. `qwen3.5:27b`) |
+| Chat Provider | Choose between Ollama or Gemini for chat and AI analysis |
 
 ## Database Schema
 
