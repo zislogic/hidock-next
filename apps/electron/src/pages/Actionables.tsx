@@ -152,10 +152,14 @@ export function Actionables() {
         // C-ACT-M01: Only keep timestamps within the rate limit window (prune old ones)
         setGenerationHistory(prev => [...prev.filter(t => now - t < 60000), now])
       } else {
-        setGenerationError(result.error.message || 'Failed to generate output')
+        const msg = result.error.message || 'Failed to generate output'
+        setGenerationError(msg)
+        toast.error('Generation failed', msg)
       }
     } catch (error: any) {
-      setGenerationError(error.message || 'Failed to generate output')
+      const msg = error.message || 'Failed to generate output'
+      setGenerationError(msg)
+      toast.error('Generation failed', msg)
       console.error('Output generation failed:', error)
     } finally {
       setGenerating(false)

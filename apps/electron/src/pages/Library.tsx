@@ -1,8 +1,18 @@
 import { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { RefreshCw, AlertCircle } from 'lucide-react'
+import { RefreshCw, AlertCircle, Copy, FileText } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
 import { toast } from '@/components/ui/toaster'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { getHiDockDeviceService } from '@/services/hidock-device'
 import { useUnifiedRecordings } from '@/hooks/useUnifiedRecordings'
 import {
@@ -188,6 +198,14 @@ export function Library() {
   const [bulkProcessing, setBulkProcessing] = useState(false)
   const [bulkProgress, setBulkProgress] = useState({ current: 0, total: 0 })
   const [deleting, setDeleting] = useState<string | null>(null)
+
+  // Output generation modal state
+  const [outputModal, setOutputModal] = useState<{
+    open: boolean
+    generating: boolean
+    content: string | null
+    error: string | null
+  }>({ open: false, generating: false, content: null, error: null })
 
   // B-LIB-006: Confirm dialog state (replaces window.confirm)
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -470,10 +488,28 @@ export function Library() {
   )
 
   const handleGenerateOutput = useCallback(
-    (recording: UnifiedRecording) => {
-      navigate('/actionables', { state: { sourceId: recording.knowledgeCaptureId || recording.id, action: 'generate' } })
+    async (recording: UnifiedRecording) => {
+      const sourceId = recording.knowledgeCaptureId || recording.id
+      setOutputModal({ open: true, generating: true, content: null, error: null })
+      try {
+        const result = await window.electronAPI.outputs.generate({
+          templateId: 'meeting_minutes',
+          knowledgeCaptureId: sourceId
+        })
+        if (result.success) {
+          setOutputModal({ open: true, generating: false, content: result.data.content, error: null })
+        } else {
+          const msg = result.error?.message || 'Failed to generate output'
+          setOutputModal({ open: true, generating: false, content: null, error: msg })
+          toast.error('Generation failed', msg)
+        }
+      } catch (e: any) {
+        const msg = e?.message || 'Failed to generate output'
+        setOutputModal({ open: true, generating: false, content: null, error: msg })
+        toast.error('Generation failed', msg)
+      }
     },
-    [navigate]
+    []
   )
 
   const handleBulkDownload = async () => {
@@ -1150,6 +1186,48 @@ export function Library() {
         variant="destructive"
         onConfirm={confirmDialog.onConfirm}
       />
+
+      {/* Output generation modal */}
+      <Dialog open={outputModal.open} onOpenChange={(open) => setOutputModal((prev) => ({ ...prev, open }))}>
+        <DialogContent className="max-w-3xl max-h-[85vh] overflow-auto">
+          <DialogHeader>
+            <DialogTitle>Meeting Minutes</DialogTitle>
+            <DialogDescription>Generated from recording transcript</DialogDescription>
+          </DialogHeader>
+          {outputModal.generating && (
+            <div className="flex items-center justify-center py-12 text-muted-foreground">
+              <RefreshCw className="h-5 w-5 animate-spin mr-2" />
+              Generating meeting minutes…
+            </div>
+          )}
+          {outputModal.error && (
+            <div className="flex items-start gap-2 p-4 bg-destructive/10 text-destructive rounded-lg text-sm">
+              <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
+              {outputModal.error}
+            </div>
+          )}
+          {outputModal.content && (
+            <div className="prose prose-sm max-w-none dark:prose-invert bg-muted/30 p-4 rounded-md border">
+              <ReactMarkdown>{outputModal.content}</ReactMarkdown>
+            </div>
+          )}
+          <DialogFooter className="gap-2">
+            {outputModal.content && (
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  await window.electronAPI.outputs.copyToClipboard(outputModal.content!)
+                  toast.success('Copied', 'Meeting minutes copied to clipboard')
+                }}
+              >
+                <Copy className="h-4 w-4 mr-2" />
+                Copy
+              </Button>
+            )}
+            <Button onClick={() => setOutputModal((prev) => ({ ...prev, open: false }))}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -3,6 +3,8 @@
  * Handles embedding generation and LLM inference via local Ollama instance
  */
 
+import { getConfig } from './config'
+
 // AI-07 FIX: These are now fallback defaults only - actual values come from config
 const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434'
 const DEFAULT_EMBEDDING_MODEL = 'nomic-embed-text'
@@ -150,9 +152,10 @@ class OllamaService {
           model: this.chatModel,
           messages: fullMessages,
           stream: false,
+          think: false, // Disable thinking mode for qwen3/deepseek-style models
           options: {
             temperature: options.temperature ?? 0.7,
-            num_predict: options.maxTokens ?? 1024
+            num_predict: options.maxTokens ?? 4096
           }
         })
       }
@@ -165,8 +168,13 @@ class OllamaService {
       const response = await fetch(`${this.baseUrl}/api/chat`, fetchOptions)
 
       if (!response.ok) {
-        console.error('Ollama chat error:', response.statusText)
-        return null
+        // Try to extract error message from Ollama's JSON response body
+        let detail = response.statusText
+        try {
+          const body = await response.json()
+          if (body?.error) detail = body.error
+        } catch { /* ignore parse failure */ }
+        throw new Error(`Ollama API error (${response.status}): ${detail}`)
       }
 
       const data: OllamaChatResponse = await response.json()
@@ -176,8 +184,8 @@ class OllamaService {
         console.log('[Ollama] Chat request was cancelled')
         return null
       }
-      console.error('Failed to chat with Ollama:', error)
-      return null
+      // Re-throw so callers can surface meaningful errors to the user
+      throw error
     }
   }
 
@@ -192,8 +200,6 @@ let ollamaInstance: OllamaService | null = null
 export function getOllamaService(): OllamaService {
   if (!ollamaInstance) {
     try {
-      // AI-07 FIX: Read config values properly from the config service
-      const { getConfig } = require('./config')
       const config = getConfig()
 
       // Read from correct config paths (embeddings.ollamaBaseUrl, embeddings.ollamaModel, chat.ollamaModel)
